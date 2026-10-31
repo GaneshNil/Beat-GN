@@ -137,3 +137,4 @@ private fun InfoRow(label: String, value: String) {
         Text(value, color = TextPrimary, fontWeight = FontWeight.Medium, fontSize = 12.sp)
     }
 }
+
