@@ -17,21 +17,22 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Dashboard
-import androidx.compose.material.icons.filled.Palette
-import androidx.compose.material.icons.filled.Settings as SettingsIcon
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.marvneo.companion.data.service.WatchCompanionService
-import com.marvneo.companion.ui.screens.DashboardScreen
-import com.marvneo.companion.ui.screens.WatchFaceStudioScreen
-import com.marvneo.companion.ui.screens.WatchSettingsScreen
+import com.marvneo.companion.ui.screens.*
+import com.marvneo.companion.ui.theme.DarkBackground
 import com.marvneo.companion.ui.theme.MarvNeoTheme
+import com.marvneo.companion.ui.theme.PrimaryElectric
 
 class MainActivity : ComponentActivity() {
 
@@ -55,7 +56,10 @@ class MainActivity : ComponentActivity() {
 
         requestRequiredPermissions()
 
-        val bleManager = (application as MarvNeoApp).bleManager
+        val app = application as MarvNeoApp
+        val bleManager = app.bleManager
+        val voiceManager = app.voiceManager
+        val database = app.database
 
         setContent {
             MarvNeoTheme {
@@ -63,11 +67,14 @@ class MainActivity : ComponentActivity() {
                 val haptic = LocalHapticFeedback.current
 
                 Scaffold(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(DarkBackground),
                     contentWindowInsets = WindowInsets.safeDrawing,
                     bottomBar = {
                         NavigationBar(
-                            tonalElevation = NavigationBarDefaults.Elevation,
+                            containerColor = Color(0xCC090D16),
+                            tonalElevation = 0.dp,
                             windowInsets = NavigationBarDefaults.windowInsets
                         ) {
                             NavigationBarItem(
@@ -79,7 +86,12 @@ class MainActivity : ComponentActivity() {
                                     }
                                 },
                                 icon = { Icon(Icons.Default.Dashboard, "Dashboard") },
-                                label = { Text("Dashboard") }
+                                label = { Text("Dashboard") },
+                                colors = NavigationBarItemDefaults.colors(
+                                    selectedIconColor = PrimaryElectric,
+                                    selectedTextColor = PrimaryElectric,
+                                    indicatorColor = PrimaryElectric.copy(alpha = 0.15f)
+                                )
                             )
                             NavigationBarItem(
                                 selected = selectedTab == 1,
@@ -89,8 +101,13 @@ class MainActivity : ComponentActivity() {
                                         selectedTab = 1
                                     }
                                 },
-                                icon = { Icon(Icons.Default.Palette, "Studio") },
-                                label = { Text("Studio") }
+                                icon = { Icon(Icons.Default.Palette, "Themes") },
+                                label = { Text("Dials") },
+                                colors = NavigationBarItemDefaults.colors(
+                                    selectedIconColor = PrimaryElectric,
+                                    selectedTextColor = PrimaryElectric,
+                                    indicatorColor = PrimaryElectric.copy(alpha = 0.15f)
+                                )
                             )
                             NavigationBarItem(
                                 selected = selectedTab == 2,
@@ -100,8 +117,45 @@ class MainActivity : ComponentActivity() {
                                         selectedTab = 2
                                     }
                                 },
-                                icon = { Icon(Icons.Default.SettingsIcon, "Settings") },
-                                label = { Text("Settings") }
+                                icon = { Icon(Icons.Default.Mic, "AI Agent") },
+                                label = { Text("Gemini") },
+                                colors = NavigationBarItemDefaults.colors(
+                                    selectedIconColor = PrimaryElectric,
+                                    selectedTextColor = PrimaryElectric,
+                                    indicatorColor = PrimaryElectric.copy(alpha = 0.15f)
+                                )
+                            )
+                            NavigationBarItem(
+                                selected = selectedTab == 3,
+                                onClick = {
+                                    if (selectedTab != 3) {
+                                        haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                                        selectedTab = 3
+                                    }
+                                },
+                                icon = { Icon(Icons.Default.Apps, "Apps") },
+                                label = { Text("Apps") },
+                                colors = NavigationBarItemDefaults.colors(
+                                    selectedIconColor = PrimaryElectric,
+                                    selectedTextColor = PrimaryElectric,
+                                    indicatorColor = PrimaryElectric.copy(alpha = 0.15f)
+                                )
+                            )
+                            NavigationBarItem(
+                                selected = selectedTab == 4,
+                                onClick = {
+                                    if (selectedTab != 4) {
+                                        haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                                        selectedTab = 4
+                                    }
+                                },
+                                icon = { Icon(Icons.Default.Settings, "Settings") },
+                                label = { Text("Settings") },
+                                colors = NavigationBarItemDefaults.colors(
+                                    selectedIconColor = PrimaryElectric,
+                                    selectedTextColor = PrimaryElectric,
+                                    indicatorColor = PrimaryElectric.copy(alpha = 0.15f)
+                                )
                             )
                         }
                     }
@@ -109,12 +163,18 @@ class MainActivity : ComponentActivity() {
                     AnimatedContent(
                         targetState = selectedTab,
                         transitionSpec = { fadeIn() togetherWith fadeOut() },
-                        label = "TabTransition"
+                        label = "MainScreenNavigation"
                     ) { tab ->
                         when (tab) {
                             0 -> DashboardScreen(bleManager = bleManager, modifier = Modifier.padding(innerPadding))
-                            1 -> WatchFaceStudioScreen(bleManager = bleManager, modifier = Modifier.padding(innerPadding))
-                            2 -> WatchSettingsScreen(
+                            1 -> WatchThemeStoreScreen(bleManager = bleManager, modifier = Modifier.padding(innerPadding))
+                            2 -> GeminiVoiceAssistantScreen(
+                                voiceManager = voiceManager,
+                                database = database,
+                                modifier = Modifier.padding(innerPadding)
+                            )
+                            3 -> WatchSoftwareScreen(bleManager = bleManager, modifier = Modifier.padding(innerPadding))
+                            4 -> WatchSettingsScreen(
                                 bleManager = bleManager,
                                 onOpenBatteryOptimization = { requestIgnoreBatteryOptimization() },
                                 modifier = Modifier.padding(innerPadding)
@@ -140,6 +200,9 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+
+        // Audio recording for Gemini Voice Assistant
+        permissions.add(Manifest.permission.RECORD_AUDIO)
 
         permissionLauncher.launch(permissions.toTypedArray())
     }

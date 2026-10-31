@@ -7,6 +7,7 @@ import android.os.Build
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -16,9 +17,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.marvneo.companion.data.ble.MarvNeoBleManager
 import com.marvneo.companion.data.ble.protocol.CrrepaProtocol
+import com.marvneo.companion.ui.components.LiquidGlassCard
 import com.marvneo.companion.ui.theme.*
 import kotlinx.coroutines.launch
 
@@ -33,9 +40,14 @@ fun WatchSettingsScreen(
     val coroutineScope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
 
-    var isFindingWatch by remember { mutableStateOf(false) }
+    val prefs = remember { context.getSharedPreferences("marv_neo_prefs", Context.MODE_PRIVATE) }
+    var geminiApiKey by remember { mutableStateOf(prefs.getString("gemini_api_key", "") ?: "") }
+    var isKeyVisible by remember { mutableStateOf(false) }
+    var apiKeySavedFeedback by remember { mutableStateOf(false) }
+
+    var is24HourFormat by remember { mutableStateOf(prefs.getBoolean("format_24h", true)) }
     var isRaiseToWake by remember { mutableStateOf(true) }
-    var isCameraMode by remember { mutableStateOf(false) }
+    var isFindingWatch by remember { mutableStateOf(false) }
 
     val isVivoOrOriginOS = remember {
         Build.MANUFACTURER.contains("vivo", ignoreCase = true) ||
@@ -45,114 +57,169 @@ fun WatchSettingsScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(16.dp)
+            .padding(horizontal = 16.dp, vertical = 10.dp)
             .verticalScroll(scrollState)
     ) {
-        Text("Device Controls", style = MaterialTheme.typography.headlineSmall, color = TextPrimary)
-        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = "Device & Agent Settings",
+            style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
+            color = TextPrimary
+        )
+        Text(
+            text = "Customization, OriginOS keep-alive, and Gemini AI configuration",
+            style = MaterialTheme.typography.bodySmall,
+            color = TextSecondary
+        )
 
-        // OriginOS 6+ / Vivo Background Keep-Alive Card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.BatteryAlert, contentDescription = "Battery", tint = AccentAmber)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        if (isVivoOrOriginOS) "OriginOS 6 Background Lock" else "Battery Optimization",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                }
-                Spacer(modifier = Modifier.height(6.dp))
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Gemini AI Agent API Configuration Card
+        LiquidGlassCard(modifier = Modifier.fillMaxWidth(), glowColor = SleepViolet, glowAlpha = 0.15f) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.SmartToy, contentDescription = null, tint = SleepViolet, modifier = Modifier.size(24.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Gemini AI API Configuration", style = MaterialTheme.typography.titleMedium, color = TextPrimary)
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                "Enter your Google Gemini API key to unlock natural language understanding and autonomous agent commands from your smartwatch.",
+                color = TextSecondary,
+                fontSize = 12.sp
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            OutlinedTextField(
+                value = geminiApiKey,
+                onValueChange = {
+                    geminiApiKey = it
+                    apiKeySavedFeedback = false
+                },
+                placeholder = { Text("AIzaSy...") },
+                label = { Text("Gemini API Key") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                visualTransformation = if (isKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                trailingIcon = {
+                    IconButton(onClick = { isKeyVisible = !isKeyVisible }) {
+                        Icon(if (isKeyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility, "Toggle Visibility")
+                    }
+                },
+                shape = RoundedCornerShape(12.dp)
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Button(
+                onClick = {
+                    prefs.edit().putString("gemini_api_key", geminiApiKey.trim()).apply()
+                    apiKeySavedFeedback = true
+                    haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = SleepViolet)
+            ) {
+                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(if (apiKeySavedFeedback) "Key Saved Successfully!" else "Save API Key", color = TextPrimary, fontWeight = FontWeight.Bold)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // OriginOS 6+ / Vivo Aggressive Battery Optimization Card
+        LiquidGlassCard(modifier = Modifier.fillMaxWidth(), glowColor = AccentAmber, glowAlpha = 0.12f) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.BatteryAlert, contentDescription = "Battery", tint = AccentAmber)
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    if (isVivoOrOriginOS) {
-                        "OriginOS suspends BLE services aggressively. Allow 'High Background Power Consumption' and 'Auto-start' to maintain 24/7 watch connection."
-                    } else {
-                        "Exclude app from battery optimizations to prevent Android from closing the watch connection in the background."
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
+                    if (isVivoOrOriginOS) "OriginOS 6+ Keep-Alive Lock" else "Background Battery Saver Exemption",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = TextPrimary
                 )
-                Spacer(modifier = Modifier.height(12.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = onOpenBatteryOptimization,
-                        colors = ButtonDefaults.buttonColors(containerColor = PrimaryElectric)
-                    ) {
-                        Text("Disable Battery Saver", color = DarkBackground)
-                    }
-
-                    if (isVivoOrOriginOS) {
-                        OutlinedButton(onClick = { openVivoBackgroundSettings(context) }) {
-                            Text("Vivo Auto-Start")
-                        }
-                    }
-                }
             }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Find Watch
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-        ) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                if (isVivoOrOriginOS) {
+                    "OriginOS 6+ suspends BLE background tasks. Enable 'High Background Power Consumption' and 'Auto-start' so the watch never disconnects."
+                } else {
+                    "Disable battery optimizations to prevent Android from closing the watch connection in the background."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary
+            )
+            Spacer(modifier = Modifier.height(12.dp))
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column {
-                    Text("Find Watch", style = MaterialTheme.typography.titleMedium)
-                    Text("Vibrates and wakes watch display", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                }
                 Button(
-                    onClick = {
-                        haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                        isFindingWatch = !isFindingWatch
-                        coroutineScope.launch {
-                            bleManager.sendCommand(CrrepaProtocol.createFindWatchPacket(isFindingWatch))
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isFindingWatch) HeartRateCrimson else AccentAmber
-                    )
+                    onClick = onOpenBatteryOptimization,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryElectric)
                 ) {
-                    Text(if (isFindingWatch) "Stop" else "Ring Watch")
+                    Text("Exempt App", color = DarkBackground, fontWeight = FontWeight.Bold)
+                }
+
+                if (isVivoOrOriginOS) {
+                    OutlinedButton(
+                        onClick = { openVivoBackgroundSettings(context) },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("OriginOS Settings")
+                    }
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
-        // Raise To Wake
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-        ) {
+        // Hardware Watch Preferences
+        LiquidGlassCard(modifier = Modifier.fillMaxWidth(), glowColor = PrimaryElectric, glowAlpha = 0.08f) {
+            Text("Smartwatch Preferences", style = MaterialTheme.typography.titleMedium, color = TextPrimary)
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // 12/24 Hour Format Toggle
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column {
-                    Text("Raise to Wake", style = MaterialTheme.typography.titleMedium)
-                    Text("Turn screen on when wrist rotates", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    Text("24-Hour Time Format", fontWeight = FontWeight.SemiBold, color = TextPrimary, fontSize = 14.sp)
+                    Text("Switch between 12-hour AM/PM and 24-hour clock", color = TextSecondary, fontSize = 11.sp)
+                }
+                Switch(
+                    checked = is24HourFormat,
+                    onCheckedChange = { checked ->
+                        is24HourFormat = checked
+                        prefs.edit().putBoolean("format_24h", checked).apply()
+                        coroutineScope.launch {
+                            bleManager.sendCommand(CrrepaProtocol.createTimeFormatPacket(checked))
+                        }
+                    }
+                )
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = BorderSubtle)
+
+            // Raise to wake toggle
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("Raise to Wake Display", fontWeight = FontWeight.SemiBold, color = TextPrimary, fontSize = 14.sp)
+                    Text("Turn screen on when wrist is raised", color = TextSecondary, fontSize = 11.sp)
                 }
                 Switch(
                     checked = isRaiseToWake,
                     onCheckedChange = { checked ->
-                        haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
                         isRaiseToWake = checked
                         coroutineScope.launch {
                             bleManager.sendCommand(CrrepaProtocol.createRaiseToWakePacket(checked))
@@ -162,89 +229,57 @@ fun WatchSettingsScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
-        // Remote Camera Shutter
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+        // Disconnect & Unpair Card
+        LiquidGlassCard(modifier = Modifier.fillMaxWidth(), glowColor = HeartRateCrimson, glowAlpha = 0.08f) {
+            Text("Device Pairing Management", style = MaterialTheme.typography.titleMedium, color = TextPrimary)
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                "Unlink the smartwatch and forget saved Bluetooth MAC address. The app will return to scan mode.",
+                color = TextSecondary,
+                fontSize = 12.sp
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            OutlinedButton(
+                onClick = {
+                    haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                    bleManager.forgetDevice()
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = HeartRateCrimson)
             ) {
-                Column {
-                    Text("Remote Camera Shutter", style = MaterialTheme.typography.titleMedium)
-                    Text("Trigger watch photo button", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                }
-                Switch(
-                    checked = isCameraMode,
-                    onCheckedChange = { open ->
-                        haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                        isCameraMode = open
-                        coroutineScope.launch {
-                            bleManager.sendCommand(CrrepaProtocol.createCameraModePacket(open))
-                        }
-                    }
-                )
+                Icon(Icons.Default.LinkOff, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Unpair & Forget Device")
             }
         }
 
         Spacer(modifier = Modifier.height(24.dp))
-        Text("Notification Whitelist", style = MaterialTheme.typography.titleLarge, color = TextPrimary)
-        Spacer(modifier = Modifier.height(8.dp))
-
-        listOf("WhatsApp", "Phone Calls", "SMS Messages", "Instagram", "Telegram", "Gmail").forEach { app ->
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-            ) {
-                var isEnabled by remember { mutableStateOf(true) }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(app, style = MaterialTheme.typography.bodyLarge)
-                    Checkbox(
-                        checked = isEnabled,
-                        onCheckedChange = {
-                            haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                            isEnabled = it
-                        }
-                    )
-                }
-            }
-        }
     }
 }
 
 private fun openVivoBackgroundSettings(context: Context) {
     try {
         val intent = Intent().apply {
-            component = ComponentName("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity")
+            component = ComponentName(
+                "com.iqoo.secure",
+                "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity"
+            )
         }
         context.startActivity(intent)
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         try {
             val intent = Intent().apply {
-                component = ComponentName("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity")
+                component = ComponentName(
+                    "com.vivo.permissionmanager",
+                    "com.vivo.permissionmanager.activity.PurviewTabActivity"
+                )
             }
             context.startActivity(intent)
-        } catch (e2: Exception) {
-            // Fallback to app details
-            val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                data = android.net.Uri.parse("package:${context.packageName}")
-            }
+        } catch (_: Exception) {
+            val intent = Intent(android.provider.Settings.ACTION_SETTINGS)
             context.startActivity(intent)
         }
     }
