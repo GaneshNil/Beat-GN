@@ -106,6 +106,13 @@ object CrrepaProtocol {
     }
 
     /**
+     * Builds 12h/24h Time format packet.
+     * @param is24Hour true for 24-hour format, false for 12-hour format.
+     */
+    fun createTimeFormatPacket(is24Hour: Boolean): ByteArray =
+        byteArrayOf(CMD_TIME_FORMAT, if (is24Hour) 0x00 else 0x01)
+
+    /**
      * Formats an incoming notification push packet.
      * Format: [0x23, AppType, TitleLen, TitleBytes..., MsgLen, MsgBytes...]
      */
