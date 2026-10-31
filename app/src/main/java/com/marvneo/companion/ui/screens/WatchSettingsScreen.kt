@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.sp
 import com.marvneo.companion.data.ble.MarvNeoBleManager
 import com.marvneo.companion.data.ble.protocol.CrrepaProtocol
 import com.marvneo.companion.ui.components.LiquidGlassCard
+import com.marvneo.companion.ui.components.LiquidGlassPill
 import com.marvneo.companion.ui.theme.*
 import kotlinx.coroutines.launch
 

@@ -377,3 +377,70 @@ fun WatchSoftwareScreen(
         }
     }
 }
+
+@Composable
+fun WatchAppCard(
+    app: WatchApp,
+    isWatchConnected: Boolean,
+    onInstall: () -> Unit
+) {
+    LiquidGlassCard(modifier = Modifier.fillMaxWidth(), glowColor = PrimaryElectric, glowAlpha = 0.08f) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = PrimaryElectric.copy(alpha = 0.15f),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, PrimaryElectric.copy(alpha = 0.3f)),
+                    modifier = Modifier.size(44.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = when (app.category) {
+                                "Games" -> Icons.Default.SportsEsports
+                                "Utility" -> Icons.Default.Calculate
+                                "Productivity" -> Icons.Default.Timer
+                                else -> Icons.Default.QrCode
+                            },
+                            contentDescription = null,
+                            tint = PrimaryElectric,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Column {
+                    Text(app.name, fontWeight = FontWeight.Bold, color = TextPrimary, fontSize = 14.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(app.category, color = TextSecondary, fontSize = 11.sp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("• ${app.sizeKb} KB", color = TextTertiary, fontSize = 11.sp)
+                    }
+                }
+            }
+
+            Button(
+                onClick = onInstall,
+                enabled = isWatchConnected,
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = PrimaryElectric),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+            ) {
+                Text(
+                    text = if (isWatchConnected) "Install" else "Locked",
+                    color = DarkBackground,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(app.description, color = TextSecondary, fontSize = 12.sp)
+    }
+}
