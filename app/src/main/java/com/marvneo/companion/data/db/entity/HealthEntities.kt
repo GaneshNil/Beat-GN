@@ -26,6 +26,14 @@ data class BloodOxygenRecord(
     val percentage: Int
 )
 
+@Entity(tableName = "blood_pressure_record")
+data class BloodPressureRecord(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val timestamp: Long,
+    val systolic: Int,
+    val diastolic: Int
+)
+
 @Entity(tableName = "sleep_record")
 data class SleepRecord(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -37,3 +45,12 @@ data class SleepRecord(
     val remMinutes: Int
 )
 
+@Entity(tableName = "alarm_record")
+data class AlarmRecord(
+    @PrimaryKey val id: Int, // 0..2
+    val hour: Int,
+    val minute: Int,
+    val repeatDays: Int,
+    val isEnabled: Boolean,
+    val label: String
+)

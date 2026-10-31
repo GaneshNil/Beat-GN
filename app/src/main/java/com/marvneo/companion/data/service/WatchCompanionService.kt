@@ -16,7 +16,6 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.marvneo.companion.MainActivity
 import com.marvneo.companion.MarvNeoApp
-import com.marvneo.companion.R
 import com.marvneo.companion.data.ble.MarvNeoBleManager
 import com.marvneo.companion.domain.model.ConnectionState
 import kotlinx.coroutines.CoroutineScope
@@ -114,8 +113,14 @@ class WatchCompanionService : Service() {
                         "Connected"
                     }
                     is ConnectionState.Connecting -> "Connecting..."
+                    is ConnectionState.Synchronizing -> "Synchronizing..."
+                    is ConnectionState.SearchingForWatch -> "Searching for Watch..."
+                    is ConnectionState.WatchFound -> "Watch Found"
+                    is ConnectionState.ConnectionUnstable -> "Connection Unstable: ${state.reason}"
+                    is ConnectionState.Reconnecting -> "Reconnecting (${state.attempt}/${state.maxAttempts})..."
+                    is ConnectionState.BluetoothDisabled -> "Bluetooth Disabled"
                     is ConnectionState.Disconnected -> "Disconnected"
-                    is ConnectionState.Error -> "Error: ${state.message}"
+                    is ConnectionState.ConnectionFailed -> "Connection Failed: ${state.error}"
                 }
                 updateNotification(stateText, bleManager.batteryFlow.value)
             }

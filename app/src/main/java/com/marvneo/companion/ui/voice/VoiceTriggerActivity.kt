@@ -15,10 +15,10 @@ class VoiceTriggerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Launch MainActivity and switch directly to Gemini Voice Assistant tab
+        // Launch MainActivity and switch directly to Voice Assistant History tab (index 4)
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra("OPEN_TAB", 2)
+            putExtra("OPEN_TAB", 4)
             putExtra("TRIGGER_VOICE_LISTENING", true)
         }
         startActivity(launchIntent)

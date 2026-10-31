@@ -1,10 +1,25 @@
 package com.marvneo.companion.domain.model
 
 sealed class ConnectionState {
-    object Disconnected : ConnectionState()
-    object Connecting : ConnectionState()
-    object Connected : ConnectionState()
-    data class Error(val message: String) : ConnectionState()
+    object BluetoothDisabled : ConnectionState()
+    object SearchingForWatch : ConnectionState()
+    data class WatchFound(val name: String, val address: String, val rssi: Int) : ConnectionState()
+    data class Connecting(val message: String = "Establishing GATT link...") : ConnectionState()
+    data class Connected(
+        val deviceName: String,
+        val deviceAddress: String,
+        val lastSeenMs: Long = System.currentTimeMillis()
+    ) : ConnectionState()
+    data class Synchronizing(val step: String = "Synchronizing watch telemetry...") : ConnectionState()
+    data class ConnectionUnstable(val reason: String) : ConnectionState()
+    data class Disconnected(val reason: String = "Watch is disconnected") : ConnectionState()
+    data class Reconnecting(val attempt: Int, val maxAttempts: Int = 5) : ConnectionState()
+    data class ConnectionFailed(val error: String) : ConnectionState()
+
+    // Backward-compatible error constructor
+    companion object {
+        fun Error(message: String): ConnectionState = ConnectionFailed(message)
+    }
 }
 
 data class DiscoveredDevice(
@@ -12,6 +27,31 @@ data class DiscoveredDevice(
     val address: String,
     val rssi: Int = -100,
     val isBonded: Boolean = false
+)
+
+data class AlarmModel(
+    val id: Int, // 0..2
+    val hour: Int,
+    val minute: Int,
+    val repeatDaysMask: Int = 0x7F, // Bitmask: bit0=Mon .. bit6=Sun
+    val isEnabled: Boolean = true,
+    val label: String = "Alarm"
+)
+
+data class HealthSummary(
+    val periodTitle: String,
+    val avgHeartRate: Double?,
+    val minHeartRate: Int?,
+    val maxHeartRate: Int?,
+    val hrReadingCount: Int,
+    val avgSpO2: Double?,
+    val minSpO2: Int?,
+    val maxSpO2: Int?,
+    val spO2ReadingCount: Int,
+    val avgSystolic: Double? = null,
+    val avgDiastolic: Double? = null,
+    val bpReadingCount: Int = 0,
+    val isBpSupported: Boolean = false
 )
 
 data class WatchTheme(
