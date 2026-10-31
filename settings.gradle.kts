@@ -13,6 +13,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "MarvNeoCompanion"
+rootProject.name = "Beat-GN"
 include(":app")
 
