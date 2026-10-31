@@ -36,6 +36,8 @@ import com.marvneo.companion.ui.theme.PrimaryElectric
 
 class MainActivity : ComponentActivity() {
 
+    private val selectedTabState = mutableIntStateOf(0)
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -50,10 +52,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Enforce Android 15/16 modern Edge-to-Edge display
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
+        handleIntentExtras(intent)
         requestRequiredPermissions()
 
         val app = application as MarvNeoApp
@@ -63,7 +65,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MarvNeoTheme {
-                var selectedTab by remember { mutableIntStateOf(0) }
+                val selectedTab by selectedTabState
                 val haptic = LocalHapticFeedback.current
 
                 Scaffold(
@@ -82,7 +84,7 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     if (selectedTab != 0) {
                                         haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                        selectedTab = 0
+                                        selectedTabState.intValue = 0
                                     }
                                 },
                                 icon = { Icon(Icons.Default.Dashboard, "Dashboard") },
@@ -98,7 +100,7 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     if (selectedTab != 1) {
                                         haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                        selectedTab = 1
+                                        selectedTabState.intValue = 1
                                     }
                                 },
                                 icon = { Icon(Icons.Default.Palette, "Themes") },
@@ -114,7 +116,7 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     if (selectedTab != 2) {
                                         haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                        selectedTab = 2
+                                        selectedTabState.intValue = 2
                                     }
                                 },
                                 icon = { Icon(Icons.Default.Mic, "AI Agent") },
@@ -130,7 +132,7 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     if (selectedTab != 3) {
                                         haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                        selectedTab = 3
+                                        selectedTabState.intValue = 3
                                     }
                                 },
                                 icon = { Icon(Icons.Default.Apps, "Apps") },
@@ -146,7 +148,7 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     if (selectedTab != 4) {
                                         haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                        selectedTab = 4
+                                        selectedTabState.intValue = 4
                                     }
                                 },
                                 icon = { Icon(Icons.Default.Settings, "Settings") },
@@ -186,6 +188,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntentExtras(intent)
+    }
+
+    private fun handleIntentExtras(intent: Intent?) {
+        val targetTab = intent?.getIntExtra("OPEN_TAB", -1) ?: -1
+        if (targetTab in 0..4) {
+            selectedTabState.intValue = targetTab
+        }
+        val triggerVoice = intent?.getBooleanExtra("TRIGGER_VOICE_LISTENING", false) ?: false
+        if (triggerVoice) {
+            val app = application as MarvNeoApp
+            app.voiceManager.startListening()
+        }
+    }
+
     private fun requestRequiredPermissions() {
         val permissions = mutableListOf<String>()
 
@@ -201,7 +221,6 @@ class MainActivity : ComponentActivity() {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // Audio recording for Gemini Voice Assistant
         permissions.add(Manifest.permission.RECORD_AUDIO)
 
         permissionLauncher.launch(permissions.toTypedArray())

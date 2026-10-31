@@ -81,6 +81,15 @@ fun WatchSettingsScreen(
                 Text("Gemini AI API Configuration", style = MaterialTheme.typography.titleMedium, color = TextPrimary)
             }
             Spacer(modifier = Modifier.height(6.dp))
+
+            if (geminiApiKey.isNotBlank()) {
+                LiquidGlassPill(color = StepsEmerald) {
+                    Icon(Icons.Default.CheckCircle, null, tint = StepsEmerald, modifier = Modifier.size(14.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("API Key Configured • Model: gemini-1.5-flash", color = StepsEmerald, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+            }
             Text(
                 "Enter your Google Gemini API key to unlock natural language understanding and autonomous agent commands from your smartwatch.",
                 color = TextSecondary,

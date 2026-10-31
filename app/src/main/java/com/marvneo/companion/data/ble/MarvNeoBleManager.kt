@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.UUID
 
 @SuppressLint("MissingPermission")
 class MarvNeoBleManager(private val context: Context) {
@@ -100,6 +101,7 @@ class MarvNeoBleManager(private val context: Context) {
                     _connectionState.value = ConnectionState.Connecting
                     reconnectAttempts = 0
                     isUserDisconnecting = false
+                    // Request MTU 512 for fast data transfer
                     gatt.requestMtu(512)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -120,10 +122,69 @@ class MarvNeoBleManager(private val context: Context) {
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                val nusService = gatt.getService(BleGattAttributes.NUS_SERVICE_UUID)
-                if (nusService != null) {
-                    txCharacteristic = nusService.getCharacteristic(BleGattAttributes.NUS_TX_CHAR_UUID)
-                    rxCharacteristic = nusService.getCharacteristic(BleGattAttributes.NUS_RX_CHAR_UUID)
+                var foundTx: BluetoothGattCharacteristic? = null
+                var foundRx: BluetoothGattCharacteristic? = null
+
+                // Phase 1: Check known Crrepa / DaFit / Nordic services
+                val knownServices = listOf(
+                    BleGattAttributes.NUS_SERVICE_UUID,
+                    BleGattAttributes.CRP_FFF0_SERVICE_UUID,
+                    BleGattAttributes.CRP_FEE7_SERVICE_UUID,
+                    BleGattAttributes.DFU_SERVICE_UUID,
+                    BleGattAttributes.HS_AE00_SERVICE_UUID,
+                    UUID.fromString("c6a22920-f821-18bf-9704-0266f20e80fd"),
+                    UUID.fromString("000034f1-0000-1000-8000-00805f9b34fb")
+                )
+
+                for (srvUuid in knownServices) {
+                    val srv = gatt.getService(srvUuid) ?: continue
+                    for (char in srv.characteristics) {
+                        val props = char.properties
+                        if (foundTx == null && (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
+                                    props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)) {
+                            foundTx = char
+                        }
+                        if (foundRx == null && (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 ||
+                                    props and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)) {
+                            foundRx = char
+                        }
+                    }
+                    if (foundTx != null && foundRx != null) {
+                        Log.i(tag, "Resolved TX/RX via known service: $srvUuid")
+                        break
+                    }
+                }
+
+                // Phase 2: Universal Fallback across all non-standard services
+                if (foundTx == null || foundRx == null) {
+                    Log.w(tag, "Known service match incomplete. Performing dynamic universal GATT scan...")
+                    for (srv in gatt.services) {
+                        val srvUuidStr = srv.uuid.toString().lowercase()
+                        // Skip standard Bluetooth SIG generic profile services
+                        if (srvUuidStr.startsWith("00001800") || srvUuidStr.startsWith("00001801") || srvUuidStr.startsWith("0000180a")) {
+                            continue
+                        }
+                        for (char in srv.characteristics) {
+                            val props = char.properties
+                            if (foundTx == null && (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
+                                        props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)) {
+                                foundTx = char
+                            }
+                            if (foundRx == null && (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 ||
+                                        props and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)) {
+                                foundRx = char
+                            }
+                        }
+                        if (foundTx != null && foundRx != null) {
+                            Log.i(tag, "Resolved TX/RX dynamically from service: ${srv.uuid}")
+                            break
+                        }
+                    }
+                }
+
+                if (foundTx != null && foundRx != null) {
+                    txCharacteristic = foundTx
+                    rxCharacteristic = foundRx
 
                     enableNotifications(gatt, rxCharacteristic)
                     _connectionState.value = ConnectionState.Connected
@@ -133,24 +194,27 @@ class MarvNeoBleManager(private val context: Context) {
                     connectedDeviceName.value = name
                     connectedDeviceAddress.value = device.address
 
-                    // Save to SharedPreferences for auto-connection
+                    // Save to preferences for subsequent auto-connect
                     prefs.edit()
                         .putString("last_device_address", device.address)
                         .putString("last_device_name", name)
                         .apply()
 
+                    Log.i(tag, "Successfully established watch communication with $name ($device.address)")
+
                     // Handshake: Time sync, battery query, and steps query
                     scope.launch {
-                        delay(300)
+                        delay(350)
                         sendCommand(CrrepaProtocol.createTimeSyncPacket())
-                        delay(200)
+                        delay(250)
                         sendCommand(CrrepaProtocol.createBatteryQueryPacket())
-                        delay(200)
+                        delay(250)
                         sendCommand(CrrepaProtocol.createStepsQueryPacket())
                     }
                 } else {
-                    Log.e(tag, "Nordic UART Service not found on device!")
-                    _connectionState.value = ConnectionState.Error("Unsupported watch protocol")
+                    Log.e(tag, "Failed to resolve GATT TX and RX characteristics on device.")
+                    _connectionState.value = ConnectionState.Error("Unable to locate watch data channels")
+                    cleanup()
                 }
             } else {
                 Log.e(tag, "Service discovery failed with status $status")
@@ -174,13 +238,74 @@ class MarvNeoBleManager(private val context: Context) {
     }
 
     init {
-        // Populate bonded devices immediately
         refreshBondedDevices()
     }
 
     /**
-     * Refresh bonded Bluetooth devices list.
+     * Checks if a BluetoothDevice matches a smartwatch (by address, name, or Bluetooth Class).
      */
+    fun isSmartwatchDevice(device: BluetoothDevice): Boolean {
+        val lastAddress = prefs.getString("last_device_address", null)
+        if (!lastAddress.isNullOrBlank() && device.address.equals(lastAddress, ignoreCase = true)) {
+            return true
+        }
+
+        val name = device.name ?: ""
+        if (name.contains("Marv", ignoreCase = true) ||
+            name.contains("beatXP", ignoreCase = true) ||
+            name.contains("MOY", ignoreCase = true) ||
+            name.contains("Watch", ignoreCase = true) ||
+            name.contains("Band", ignoreCase = true)
+        ) {
+            return true
+        }
+
+        val deviceClass = device.bluetoothClass?.majorDeviceClass
+        if (deviceClass == BluetoothClass.Device.Major.WEARABLE ||
+            deviceClass == BluetoothClass.Device.Major.HEALTH
+        ) {
+            return true
+        }
+
+        return false
+    }
+
+    /**
+     * Automatically connects to a connected or bonded smartwatch device.
+     */
+    fun autoConnect(): Boolean {
+        val adapter = bluetoothAdapter ?: return false
+        if (!adapter.isEnabled) return false
+
+        // 1. Check if device is already connected via GATT
+        val gattConnected = bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
+        val connectedWatch = gattConnected.firstOrNull { isSmartwatchDevice(it) }
+        if (connectedWatch != null) {
+            Log.i(tag, "Found already connected GATT watch: ${connectedWatch.name} (${connectedWatch.address})")
+            connect(connectedWatch.address)
+            return true
+        }
+
+        // 2. Check saved device address
+        val lastAddress = prefs.getString("last_device_address", null)
+        if (!lastAddress.isNullOrBlank()) {
+            Log.i(tag, "Auto-connecting to previously paired address: $lastAddress")
+            connect(lastAddress)
+            return true
+        }
+
+        // 3. Check bonded devices for any smartwatch
+        val bonded = adapter.bondedDevices
+        val bondedWatch = bonded?.firstOrNull { isSmartwatchDevice(it) }
+        if (bondedWatch != null) {
+            Log.i(tag, "Auto-connecting to bonded watch: ${bondedWatch.name} (${bondedWatch.address})")
+            connect(bondedWatch.address)
+            return true
+        }
+
+        return false
+    }
+
     fun refreshBondedDevices() {
         val adapter = bluetoothAdapter ?: return
         if (!adapter.isEnabled) return
@@ -195,25 +320,26 @@ class MarvNeoBleManager(private val context: Context) {
             val item = DiscoveredDevice(
                 name = name,
                 address = address,
-                rssi = -55,
+                rssi = -50,
                 isBonded = true
             )
             if (existingIndex >= 0) {
                 currentList[existingIndex] = item
             } else {
-                currentList.add(0, item) // Place bonded at the top
+                if (isSmartwatchDevice(device)) {
+                    currentList.add(0, item)
+                } else {
+                    currentList.add(item)
+                }
             }
         }
         _discoveredDevices.value = currentList
     }
 
-    /**
-     * Start live BLE radar scan for smartwatches.
-     */
     fun startScan() {
         val adapter = bluetoothAdapter ?: return
         if (!adapter.isEnabled) {
-            Log.w(tag, "Bluetooth is disabled. Cannot start scan.")
+            Log.w(tag, "Bluetooth disabled. Cannot scan.")
             return
         }
 
@@ -238,7 +364,6 @@ class MarvNeoBleManager(private val context: Context) {
             scanner.startScan(null, settings, scanCallback)
             Log.i(tag, "BLE Scan started.")
 
-            // Automatically stop scan after 15 seconds
             scanTimeoutJob?.cancel()
             scanTimeoutJob = scope.launch {
                 delay(15_000)
@@ -250,9 +375,6 @@ class MarvNeoBleManager(private val context: Context) {
         }
     }
 
-    /**
-     * Stop BLE scan.
-     */
     fun stopScan() {
         scanTimeoutJob?.cancel()
         if (_isScanning.value) {
@@ -271,7 +393,6 @@ class MarvNeoBleManager(private val context: Context) {
         val record = result.scanRecord
         val name = device.name ?: record?.deviceName
 
-        // Filter out empty or noise names, prioritize smartwatches
         if (name.isNullOrBlank()) return
 
         val address = device.address
@@ -286,12 +407,7 @@ class MarvNeoBleManager(private val context: Context) {
         if (existingIndex >= 0) {
             currentList[existingIndex] = discovered
         } else {
-            // Give preference to beatXP, Marv, DaFit, and MOY devices
-            if (name.contains("Marv", ignoreCase = true) ||
-                name.contains("beatXP", ignoreCase = true) ||
-                name.contains("MOY", ignoreCase = true) ||
-                name.contains("Watch", ignoreCase = true)
-            ) {
+            if (isSmartwatchDevice(device)) {
                 currentList.add(0, discovered)
             } else {
                 currentList.add(discovered)
@@ -300,40 +416,6 @@ class MarvNeoBleManager(private val context: Context) {
         _discoveredDevices.value = currentList
     }
 
-    /**
-     * Attempts auto-connection:
-     * 1) Checks saved device address from previous successful connection.
-     * 2) If no saved device, looks for bonded Marv Neo or beatXP watch.
-     */
-    fun autoConnect(): Boolean {
-        val lastAddress = prefs.getString("last_device_address", null)
-        if (!lastAddress.isNullOrBlank() && bluetoothAdapter?.isEnabled == true) {
-            Log.i(tag, "Auto-connecting to previously paired device: $lastAddress")
-            connect(lastAddress)
-            return true
-        }
-
-        // Check bonded devices for Marv Neo / beatXP
-        val bonded = bluetoothAdapter?.bondedDevices
-        val watchDevice = bonded?.firstOrNull {
-            val name = it.name ?: ""
-            name.contains("Marv", ignoreCase = true) ||
-                    name.contains("beatXP", ignoreCase = true) ||
-                    name.contains("MOY", ignoreCase = true)
-        }
-
-        if (watchDevice != null) {
-            Log.i(tag, "Auto-connecting to bonded watch: ${watchDevice.name} (${watchDevice.address})")
-            connect(watchDevice.address)
-            return true
-        }
-
-        return false
-    }
-
-    /**
-     * Connect to a specific watch MAC address.
-     */
     fun connect(macAddress: String) {
         if (macAddress.isBlank()) return
         val adapter = bluetoothAdapter ?: return
@@ -381,9 +463,6 @@ class MarvNeoBleManager(private val context: Context) {
         }
     }
 
-    /**
-     * Immediately disconnects the watch and stops any auto-reconnection.
-     */
     fun disconnect() {
         isUserDisconnecting = true
         targetDeviceAddress = null
@@ -400,9 +479,6 @@ class MarvNeoBleManager(private val context: Context) {
         cleanup()
     }
 
-    /**
-     * Clears paired device preference and disconnects.
-     */
     fun forgetDevice() {
         prefs.edit().remove("last_device_address").remove("last_device_name").apply()
         disconnect()
@@ -415,13 +491,10 @@ class MarvNeoBleManager(private val context: Context) {
         char.value = packet
         char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         val success = gatt.writeCharacteristic(char)
-        delay(35) // Enforce interval between sequential GATT writes
+        delay(35)
         return success
     }
 
-    /**
-     * Flashes raw binary chunks (e.g. watchface or mini-app payload) with live progress.
-     */
     suspend fun flashBinaryChunks(
         chunks: List<ByteArray>,
         onProgress: (Float) -> Unit
@@ -433,7 +506,7 @@ class MarvNeoBleManager(private val context: Context) {
             val success = sendCommand(chunk)
             if (!success) {
                 delay(30)
-                sendCommand(chunk) // 1 retry
+                sendCommand(chunk)
             }
             onProgress((i + 1).toFloat() / total.toFloat())
             delay(15)

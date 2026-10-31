@@ -3,6 +3,7 @@ package com.marvneo.companion.data.service
 import android.annotation.SuppressLint
 import android.app.*
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -11,6 +12,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.marvneo.companion.MainActivity
 import com.marvneo.companion.MarvNeoApp
@@ -23,8 +25,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
+@SuppressLint("MissingPermission")
 class WatchCompanionService : Service() {
 
+    private val tag = "WatchCompanionService"
     private val binder = LocalBinder()
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private lateinit var bleManager: MarvNeoBleManager
@@ -35,10 +39,42 @@ class WatchCompanionService : Service() {
 
     private val bluetoothReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
-                val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
-                if (state == BluetoothAdapter.STATE_TURNING_OFF || state == BluetoothAdapter.STATE_OFF) {
-                    bleManager.disconnect()
+            when (intent?.action) {
+                BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                    if (state == BluetoothAdapter.STATE_TURNING_OFF || state == BluetoothAdapter.STATE_OFF) {
+                        bleManager.disconnect()
+                    } else if (state == BluetoothAdapter.STATE_ON) {
+                        bleManager.autoConnect()
+                    }
+                }
+                BluetoothDevice.ACTION_ACL_CONNECTED -> {
+                    val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    device?.let { dev ->
+                        if (bleManager.isSmartwatchDevice(dev)) {
+                            Log.i(tag, "Smartwatch connected via Bluetooth: ${dev.name} (${dev.address}). Connecting GATT...")
+                            bleManager.connect(dev.address)
+                        }
+                    }
+                }
+                BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+                    val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    device?.let { dev ->
+                        if (dev.address == bleManager.connectedDeviceAddress.value) {
+                            Log.w(tag, "Connected watch disconnected from phone Bluetooth.")
+                            bleManager.disconnect()
+                        }
+                    }
                 }
             }
         }
@@ -62,13 +98,19 @@ class WatchCompanionService : Service() {
 
         startForeground(notificationId, buildNotification("Disconnected", 0))
 
-        registerReceiver(bluetoothReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
+        val filter = IntentFilter().apply {
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+            addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
+            addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+            addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        }
+        registerReceiver(bluetoothReceiver, filter)
 
         scope.launch {
             bleManager.connectionState.collectLatest { state ->
                 val stateText = when (state) {
                     is ConnectionState.Connected -> {
-                        wakeLock?.acquire(10_000) // Brief lock during connection negotiation
+                        wakeLock?.acquire(10_000)
                         "Connected"
                     }
                     is ConnectionState.Connecting -> "Connecting..."
@@ -86,12 +128,19 @@ class WatchCompanionService : Service() {
                 }
             }
         }
+
+        // Automatic connection on service start
+        scope.launch {
+            bleManager.autoConnect()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val macAddress = intent?.getStringExtra("MAC_ADDRESS")
         if (!macAddress.isNullOrBlank()) {
             bleManager.connect(macAddress)
+        } else {
+            bleManager.autoConnect()
         }
         return START_STICKY
     }
@@ -106,46 +155,47 @@ class WatchCompanionService : Service() {
         }
     }
 
-    @SuppressLint("NotificationPermission")
-    private fun updateNotification(status: String, battery: Int) {
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(notificationId, buildNotification(status, battery))
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            channelId,
+            "Watch Companion Service",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Maintains persistent BLE connection with beatXP Marv Neo"
+            setShowBadge(false)
+        }
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
     }
 
-    private fun buildNotification(status: String, battery: Int): Notification {
+    private fun buildNotification(statusText: String, batteryPercentage: Int): Notification {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
         val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
+            this, 0, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val content = if (status == "Connected") "Connected • Battery: $battery%" else status
+        val content = if (statusText == "Connected") {
+            "Watch Connected • Battery: $batteryPercentage%"
+        } else {
+            "Watch Status: $statusText"
+        }
 
         return NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Marv Neo Companion")
+            .setContentTitle("beatXP Marv Neo Companion")
             .setContentText(content)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                channelId,
-                getString(R.string.channel_name),
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = getString(R.string.channel_desc)
-                setShowBadge(false)
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
-        }
+    private fun updateNotification(statusText: String, batteryPercentage: Int) {
+        val notification = buildNotification(statusText, batteryPercentage)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(notificationId, notification)
     }
 }

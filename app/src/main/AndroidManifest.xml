@@ -56,6 +56,20 @@
             </intent-filter>
         </activity>
 
+        <!-- Voice Assistant Trigger Activity for Watch Button Interception -->
+        <activity
+            android:name=".ui.voice.VoiceTriggerActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VOICE_COMMAND" />
+                <action android:name="android.speech.RecognizerIntent.ACTION_VOICE_SEARCH_HANDS_FREE" />
+                <action android:name="android.intent.action.VOICE_ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.VOICE" />
+            </intent-filter>
+        </activity>
+
         <!-- Connected Device Foreground Service -->
         <service
             android:name=".data.service.WatchCompanionService"

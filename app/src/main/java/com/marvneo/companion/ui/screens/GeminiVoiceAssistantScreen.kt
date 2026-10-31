@@ -323,3 +323,4 @@ fun VoiceMessageBubble(message: VoiceMessageRecord) {
         }
     }
 }
+

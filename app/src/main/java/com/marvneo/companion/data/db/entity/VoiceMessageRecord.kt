@@ -12,3 +12,4 @@ data class VoiceMessageRecord(
     val toolExecuted: String? = null,
     val status: String = "completed"
 )
+

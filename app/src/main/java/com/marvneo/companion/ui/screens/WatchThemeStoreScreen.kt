@@ -471,3 +471,4 @@ private fun generateThemeBitmap(theme: WatchTheme): ByteArray {
 
     return WatchFaceConverter.convertBitmapToDialBinary(bitmap)
 }
+

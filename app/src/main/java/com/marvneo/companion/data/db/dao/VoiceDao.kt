@@ -18,3 +18,4 @@ interface VoiceDao {
     @Query("DELETE FROM voice_messages")
     suspend fun clearHistory()
 }
+

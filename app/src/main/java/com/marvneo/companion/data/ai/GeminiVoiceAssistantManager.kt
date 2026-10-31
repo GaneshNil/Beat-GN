@@ -59,29 +59,24 @@ class GeminiVoiceAssistantManager(
     val bluetoothScoActive: StateFlow<Boolean> = _bluetoothScoActive.asStateFlow()
 
     init {
-        // Initialize TextToSpeech engine
         textToSpeech = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 textToSpeech?.language = Locale.getDefault()
                 ttsReady = true
-                Log.i(tag, "TextToSpeech initialized successfully.")
+                Log.i(tag, "TextToSpeech initialized.")
             } else {
                 Log.e(tag, "TextToSpeech initialization failed.")
             }
         }
     }
 
-    /**
-     * Toggles Bluetooth Hands-Free Profile (SCO) audio routing
-     * to direct microphone input and speaker output through the smartwatch.
-     */
     fun setBluetoothScoEnabled(enabled: Boolean) {
         try {
             if (enabled) {
                 audioManager.startBluetoothSco()
                 audioManager.isBluetoothScoOn = true
                 _bluetoothScoActive.value = true
-                Log.i(tag, "Bluetooth SCO activated for watch audio.")
+                Log.i(tag, "Bluetooth SCO activated.")
             } else {
                 audioManager.stopBluetoothSco()
                 audioManager.isBluetoothScoOn = false
@@ -93,9 +88,6 @@ class GeminiVoiceAssistantManager(
         }
     }
 
-    /**
-     * Start listening for voice command via SpeechRecognizer.
-     */
     fun startListening() {
         if (_isListening.value) return
 
@@ -106,7 +98,6 @@ class GeminiVoiceAssistantManager(
                     return@launch
                 }
 
-                // Enable Bluetooth SCO if watch is connected for calling audio
                 setBluetoothScoEnabled(true)
 
                 speechRecognizer?.destroy()
@@ -122,11 +113,11 @@ class GeminiVoiceAssistantManager(
                 speechRecognizer?.setRecognitionListener(object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
                         _isListening.value = true
-                        _liveSpokenText.value = "Listening..."
+                        _liveSpokenText.value = "Listening to your voice..."
                     }
 
                     override fun onBeginningOfSpeech() {
-                        _liveSpokenText.value = "Hearing voice..."
+                        _liveSpokenText.value = "Hearing speech..."
                     }
 
                     override fun onRmsChanged(rmsdB: Float) {}
@@ -172,9 +163,6 @@ class GeminiVoiceAssistantManager(
         }
     }
 
-    /**
-     * Stop listening.
-     */
     fun stopListening() {
         scope.launch(Dispatchers.Main) {
             try {
@@ -186,14 +174,11 @@ class GeminiVoiceAssistantManager(
         }
     }
 
-    /**
-     * Process prompt through Gemini API with Agentic tool calling.
-     */
     fun processUserPrompt(query: String) {
         scope.launch {
             _isProcessing.value = true
 
-            // Save user query to Room database
+            // 1. Log user query in local Room DB
             database.voiceDao().insertMessage(
                 VoiceMessageRecord(
                     timestamp = System.currentTimeMillis(),
@@ -202,22 +187,20 @@ class GeminiVoiceAssistantManager(
                 )
             )
 
-            val apiKey = prefs.getString("gemini_api_key", "") ?: ""
-            val responseText: String
-            var toolExecuted: String? = null
+            // 2. Fetch API key from SharedPreferences
+            val apiKey = prefs.getString("gemini_api_key", "")?.trim() ?: ""
 
-            if (apiKey.isBlank()) {
-                // Autonomous local fallback engine when API key is not yet set
-                val localResult = executeLocalAgentIntent(query)
-                responseText = localResult.first
-                toolExecuted = localResult.second
+            // 3. Process with Gemini API or local commands
+            val result: Pair<String, String?> = if (apiKey.isBlank()) {
+                executeLocalAgentIntent(query, isKeyConfigured = false)
             } else {
-                val geminiResult = callGeminiApi(apiKey, query)
-                responseText = geminiResult.first
-                toolExecuted = geminiResult.second
+                callGeminiApi(apiKey, query)
             }
 
-            // Save Gemini response to Room database
+            val responseText = result.first
+            val toolExecuted = result.second
+
+            // 4. Log response in local Room DB
             database.voiceDao().insertMessage(
                 VoiceMessageRecord(
                     timestamp = System.currentTimeMillis(),
@@ -229,7 +212,7 @@ class GeminiVoiceAssistantManager(
 
             _isProcessing.value = false
 
-            // Speak answer over Bluetooth watch speaker
+            // 5. Speak answer over Bluetooth watch speaker
             speakResponse(responseText)
         }
     }
@@ -245,27 +228,23 @@ class GeminiVoiceAssistantManager(
             setBluetoothScoEnabled(true)
 
             textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "MarvNeoTtsUtterance")
-            delay(minOf(6000L, 80L * text.length))
+            delay(minOf(7000L, 80L * text.length))
             _isSpeaking.value = false
             setBluetoothScoEnabled(false)
         }
     }
 
-    /**
-     * Local deterministic agentic dispatcher.
-     * Executes commands instantly even without internet or API key.
-     */
-    private suspend fun executeLocalAgentIntent(query: String): Pair<String, String?> {
+    private suspend fun executeLocalAgentIntent(query: String, isKeyConfigured: Boolean = true): Pair<String, String?> {
         val lower = query.lowercase(Locale.ROOT)
         return when {
-            lower.contains("find") || lower.contains("locate") || lower.contains("where is my watch") -> {
+            lower.contains("find") || lower.contains("locate") || lower.contains("vibrate") -> {
                 bleManager.sendCommand(CrrepaProtocol.createFindWatchPacket(true))
-                Pair("I have signaled your watch. It is vibrating now.", "FindWatch")
+                Pair("I have signaled your Marv Neo. It is vibrating now.", "FindWatch")
             }
-            lower.contains("heart rate") || lower.contains("pulse") -> {
+            lower.contains("heart rate") || lower.contains("pulse") || lower.contains("bpm") -> {
                 val bpm = bleManager.heartRateFlow.value
                 val msg = if (bpm > 0) "Your current heart rate is $bpm beats per minute."
-                else "Starting a live heart rate measurement on your watch now."
+                else "Starting live heart rate measurement on your watch."
                 if (bpm == 0) bleManager.sendCommand(CrrepaProtocol.createHeartRateControlPacket(true))
                 Pair(msg, "MeasureHeartRate")
             }
@@ -279,13 +258,13 @@ class GeminiVoiceAssistantManager(
             lower.contains("step") || lower.contains("walk") || lower.contains("distance") -> {
                 val steps = bleManager.stepsFlow.value
                 val cal = bleManager.caloriesFlow.value
-                Pair("You have walked $steps steps today, burning $cal calories.", "QuerySteps")
+                Pair("You have walked $steps steps today, burning $cal kcal.", "QuerySteps")
             }
             lower.contains("battery") -> {
                 val batt = bleManager.batteryFlow.value
                 Pair("Your watch battery is at $batt percent.", "QueryBattery")
             }
-            lower.contains("sync time") || lower.contains("what time is it") -> {
+            lower.contains("sync time") || lower.contains("what time is it") || lower.contains("clock") -> {
                 bleManager.sendCommand(CrrepaProtocol.createTimeSyncPacket())
                 Pair("Watch clock has been synchronized with your phone.", "SyncTime")
             }
@@ -294,41 +273,51 @@ class GeminiVoiceAssistantManager(
                 Pair("Camera remote shutter is now active on your watch.", "CameraRemote")
             }
             else -> {
-                Pair(
-                    "I received your command: \"$query\". Add your Gemini API key in Settings for full natural reasoning.",
-                    null
-                )
+                if (!isKeyConfigured) {
+                    Pair(
+                        "Command recognized: \"$query\". Please configure your Gemini API Key in Settings for open conversational reasoning.",
+                        null
+                    )
+                } else {
+                    Pair(
+                        "I processed your command: \"$query\". Watch telemetry: ${bleManager.stepsFlow.value} steps, ${bleManager.heartRateFlow.value} BPM.",
+                        null
+                    )
+                }
             }
         }
     }
 
     /**
-     * Calls Google Gemini API with system instruction and tool definitions.
+     * Calls Google Gemini API using the official gemini-1.5-flash endpoint.
      */
     private suspend fun callGeminiApi(apiKey: String, query: String): Pair<String, String?> = withContext(Dispatchers.IO) {
         try {
-            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+            // Use gemini-1.5-flash (official stable API endpoint)
+            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$apiKey"
             val url = URL(endpoint)
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
             conn.doOutput = true
-            conn.connectTimeout = 8000
-            conn.readTimeout = 8000
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
 
             val currentSteps = bleManager.stepsFlow.value
             val currentHr = bleManager.heartRateFlow.value
             val currentBattery = bleManager.batteryFlow.value
 
-            val systemInstruction = """
-                You are the autonomous voice assistant for the beatXP Marv Neo smartwatch.
+            val promptText = """
+                You are the autonomous voice AI agent for the user's beatXP Marv Neo smartwatch.
                 Current Watch Telemetry: Steps: $currentSteps, Heart Rate: $currentHr BPM, Battery: $currentBattery%.
-                You can directly execute watch actions by including a tool marker at the start of your reply:
+                You can execute physical watch actions by prefixing your reply with an action tag:
                 [TOOL:FindWatch] - If asked to find, vibrate, or locate the watch.
-                [TOOL:SyncTime] - If asked to sync time or fix clock.
+                [TOOL:SyncTime] - If asked to sync time or clock.
                 [TOOL:MeasureHR] - If asked to measure pulse or heart rate.
                 [TOOL:CameraShutter] - If asked to take a photo.
-                Keep responses very concise (1 to 2 sentences) because they will be read aloud through the watch speaker.
+                Keep spoken responses very concise (1 to 2 sentences) because they will be read aloud through the watch speaker.
+
+                User command: $query
             """.trimIndent()
 
             val requestJson = JSONObject().apply {
@@ -336,7 +325,7 @@ class GeminiVoiceAssistantManager(
                     put(JSONObject().apply {
                         put("role", "user")
                         put("parts", JSONArray().apply {
-                            put(JSONObject().put("text", "$systemInstruction\n\nUser: $query"))
+                            put(JSONObject().put("text", promptText))
                         })
                     })
                 })
@@ -354,34 +343,42 @@ class GeminiVoiceAssistantManager(
                 reader.close()
 
                 val root = JSONObject(rawResponse)
-                val text = root.getJSONArray("candidates")
-                    .getJSONObject(0)
-                    .getJSONObject("content")
-                    .getJSONArray("parts")
-                    .getJSONObject(0)
-                    .getString("text")
+                val candidates = root.optJSONArray("candidates")
+                if (candidates != null && candidates.length() > 0) {
+                    val candidate = candidates.getJSONObject(0)
+                    val content = candidate.getJSONObject("content")
+                    val parts = content.getJSONArray("parts")
+                    val text = parts.getJSONObject(0).getString("text")
 
-                // Extract tool call if present
-                var tool: String? = null
-                var cleanText = text
-                if (text.contains("[TOOL:")) {
-                    val start = text.indexOf("[TOOL:")
-                    val end = text.indexOf("]", start)
-                    if (start >= 0 && end > start) {
-                        tool = text.substring(start + 6, end).trim()
-                        cleanText = text.removeRange(start, end + 1).trim()
-                        executeTool(tool)
+                    var tool: String? = null
+                    var cleanText = text
+                    if (text.contains("[TOOL:")) {
+                        val start = text.indexOf("[TOOL:")
+                        val end = text.indexOf("]", start)
+                        if (start >= 0 && end > start) {
+                            tool = text.substring(start + 6, end).trim()
+                            cleanText = text.removeRange(start, end + 1).trim()
+                            executeTool(tool)
+                        }
                     }
-                }
 
-                Pair(cleanText, tool)
+                    Pair(cleanText, tool)
+                } else {
+                    executeLocalAgentIntent(query, isKeyConfigured = true)
+                }
             } else {
-                Log.e(tag, "Gemini API error code: $responseCode")
-                executeLocalAgentIntent(query)
+                val errBody = conn.errorStream?.bufferedReader()?.readText() ?: "HTTP $responseCode"
+                Log.e(tag, "Gemini API HTTP Error ($responseCode): $errBody")
+                val cleanErrorMsg = try {
+                    JSONObject(errBody).getJSONObject("error").getString("message")
+                } catch (_: Exception) {
+                    errBody.take(120)
+                }
+                Pair("Gemini API Error ($responseCode): $cleanErrorMsg", null)
             }
         } catch (e: Exception) {
-            Log.e(tag, "Error calling Gemini API", e)
-            executeLocalAgentIntent(query)
+            Log.e(tag, "Gemini API Connection Exception", e)
+            Pair("Network Error: ${e.localizedMessage ?: "Failed to reach Gemini API"}", null)
         }
     }
 
