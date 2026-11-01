@@ -1,0 +1,36 @@
+# Root-cause matrix
+
+Every row is a defect found in the previous build, the mechanism that caused it, and the change that
+removes the mechanism (not just the symptom). "Verified" means verified by build, lint or unit test in
+this environment. Hardware-dependent rows are marked BLOCKED.
+
+| # | Symptom in old build | Root cause | Evidence | Fix in this build | Verification |
+| :-- | :--- | :--- | :--- | :--- | :--- |
+| 1 | "Connected" shown while the watch was off / unreachable | The state was set from the return value of `writeCharacteristic()` / `connectGatt()`. Those only mean "the request was queued", not "the peer answered". | Android `BluetoothGatt` contract; old `MarvNeoBleManager` had a `_isConnected` boolean set after a write | `ConnectionState.Ready` is published only after discovery + CCCD writes + a real `2A19` battery read returning a plausible value. A silent device becomes `Unstable`, never `Ready`. | Build + lint; state machine unit-testable (pure `ConnectionState`); BLOCKED on hardware |
+| 2 | GATT status 133 storms, commands intermittently lost | Several GATT requests issued in parallel. Android allows one outstanding request per connection. | Old connect routine wrote MTU, CCCD and time sync concurrently | Single `Mutex`-guarded `runGattOp` with a `CompletableDeferred` completed by the actual callback and a timeout | Build + lint; BLOCKED on hardware |
+| 3 | Heart rate showed the same value, or ~109, while idle | Opcode `0x6D`'s reply byte is a **completion state**, not BPM, and was parsed as BPM. | `com.crrepa.l.a#K0` → `onOnceMeasureComplete(payload[0])`; real BPM is on `2A37` | BPM read only from `2A37` (8/16-bit per flags); `0x6D` reply is only a state. | Unit tests `parseHeartRateMeasurement`; BLOCKED on hardware |
+| 4 | SpO2 / BP values appeared without a measurement | Values were defaulted/seeded, and UI showed `0` as if it were a reading | Old screens initialised telemetry with sample values; `0 bpm`, `0 %` | Flows start at `0`/`null` but UI renders `—` plus "not reported"; writes happen only from a parsed real packet | Unit tests for parsers; UI copy review |
+| 5 | Blood pressure presented as a normal feature | Protocol supports a BP request, but the unit may never answer; the app had a BP table and UI regardless | No evidence of an actual BP packet in the reference app's UI flow | BP card says "no blood-pressure data has ever been received" unless a real 3-byte `0x69` reply was parsed; `bloodPressureEverReported` gate | Unit test `parseBloodPressure`; BLOCKED on hardware |
+| 6 | "Alarm synced" badge with no confirmation | No acknowledgement exists for `0x11`; the old code marked a row synced after a write | `com.crrepa.l.a#w0` has no `0x11` case; `queryAllNewAlarm` is the only read path | Rows stay `PENDING`; UI says "pending"; explicit notice explains the firmware limitation | Build + lint; BLOCKED on hardware |
+| 7 | "Find watch succeeded" toast with no evidence | `findDevice()` has no reply opcode; write success was treated as device success | `com.crrepa.g.a#findDevice` = `Q(97, null)`; no `0x61` case in `w0` | Outcome is `AwaitingAcknowledgement` ("sent, unconfirmed") | Build + lint; BLOCKED on hardware |
+| 8 | Wrong GATT UUIDs, device never really worked | Old doc/app used Nordic UART `6e400001…` and `FFF0/FFF1/FFF2`; vendor SDK uses `FEEA` + `FEE1/FEE2/FEE3` | `com.crrepa.p.a`, `com.crrepa.g.e#onServicesDiscovered` | UUIDs replaced; a device missing FEE1/FEE2/FEE3 is refused with a specific message | Build + lint; BLOCKED on hardware |
+| 9 | Fabricated protocol documentation | `HARDWARE_PROTOCOL.md` invented a checksum byte, 512-byte MTU and opcodes `0x01/0x03/0x1C` | Bytecode contradicts every one of those | Replaced by `PROTOCOL_EVIDENCE.md` with per-claim class/method citations and CONFIRMED/INFERRED/UNKNOWN labels | Documentation review |
+| 10 | "AI assistant" produced conversations with no source | Gemini manager generated its own content; no watch→phone transcript channel exists | `CRPChatChangeListener` has only phone-side recording callbacks | Gemini manager, API key UI and network usage deleted; Assistant screen is an honest empty state | Source search: no Gemini class, key or endpoint; the word appears only in explanatory copy about what was removed |
+| 11 | Notification scraping of other apps | `WatchNotificationListenerService` read all notifications and sent summaries | Old manifest + service | Service deleted; manifest entry and permission removed | Manifest review |
+| 12 | Microphone "trigger" activity | `VoiceTriggerActivity` started capture without a user-visible recording flow | Old source | Deleted | Source review |
+| 13 | Watch-face / app "flashing" reported success | `WatchFaceConverter` faked a progress bar and success toast; no bytes written to a verified OTA channel | Old source | Deleted; documented as not implemented | Source review |
+| 14 | Reports used a rolling 24 h window for "today" and mislabelled averages | Aggregation took `now - 24h`; no timezone handling; empty days omitted from charts | Old `HealthReportsScreen` / DAO query | Pure `ReportWindows` uses local midnight, 7 calendar days and month start; `HealthAggregator` builds one bucket per day with `null` for gaps | Unit tests cover boundaries, dedupe, validity, daily buckets |
+| 15 | Duplicate sensor readings inflated counts and averages | No dedupe; retries inserted twice | Same value re-notified within seconds | `HealthRepository` rejects duplicates within ±5 s and `HealthAggregator` dedupes within 3 s | Unit tests |
+| 16 | Alarm slots hardcoded and inconsistent | UI had a fixed list of five times, not the stored rows | Old `WatchSettingsScreen` | Room `alarm_record` is the source; editor writes the row; slot is the primary key | Build + lint |
+| 17 | Purple/blue gradient "AI" theme, unreadable on light mode | Dynamic colour + gradient cards + neon accents | Old `Theme.kt`, `LiquidGlass.kt`, `MetricCard.kt` | Graphite/sand neutrals + one copper accent; dynamic colour removed; semantic colours only for data/status; components rewritten | Visual review of source tokens |
+| 18 | Layouts clipped on small phones | Fixed widths, nested horizontal rows, non-scrollable columns | Old screens | `LazyColumn` roots, `weight`-based metric rows, no fixed widths on text; dialogs use `weight` fields | Source review; BLOCKED on emulator/device for pixel proof |
+| 19 | Database migration could destroy data | Version bump without a migration | Old `AppDatabase` | Additive `MIGRATION_3_4` (`syncState`, `updatedAt`, `sessionId`); earlier migrations kept | KSP compile; schema not exported |
+| 20 | Background link died on OEMs, no honest status | No foreground service state mirror or reconnect policy | Old service | Foreground service mirrors the real `ConnectionState`; bounded exponential reconnect (max 5) | Build + lint; BLOCKED on hardware |
+
+## Notes on what is *not* claimed fixed
+
+* Alarm acknowledgement cannot be fixed in the app; it needs a firmware read-back. The app is honest
+  about it rather than pretending.
+* Find-watch confirmation cannot be fixed for the same reason.
+* Blood pressure support is a property of the physical unit, not of the app.
+* Pixel-level layout verification needs a device or emulator; none is installed here.

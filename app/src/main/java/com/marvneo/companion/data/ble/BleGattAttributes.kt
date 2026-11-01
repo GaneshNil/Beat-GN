@@ -2,32 +2,51 @@ package com.marvneo.companion.data.ble
 
 import java.util.UUID
 
+/**
+ * GATT identifiers used by Crrepa-class firmware (the family the reference beatXP app targets).
+ *
+ * Evidence: `com.crrepa.p.a` in the reference APK maps an incoming `BluetoothGattService` list to
+ * fields by UUID substring. It looks for service `feea` with characteristics `fee1`, `fee2`,
+ * `fee3`, `fee5`, `fee6`, `fee7`, `fee8`; service `180f` / `2a19` (battery); service `180d` /
+ * `2a37` (heart rate); and service `180a` / `2a24`, `2a28`, `2a29` (device information).
+ * `com.crrepa.g.e#onServicesDiscovered` treats a device as usable only when `fee1`, `fee2` and
+ * `fee3` all exist, then subscribes to `fee3`, `2a37`, `fee7`, `fee8` and `fee1`.
+ *
+ * The previously shipped UUIDs (FFF0/FFF1/FFF2 and FEE7/FEB1/FEB2) do not appear in the vendor
+ * SDK as the Marv Neo data channel; they were assumptions. They are gone.
+ */
 object BleGattAttributes {
-    // 1. Nordic UART Service
-    val NUS_SERVICE_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
-    val NUS_TX_CHAR_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
-    val NUS_RX_CHAR_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
 
-    // 2. Crrepa FFF0 Service (Very common in Marv Neo / MOY / DaFit hardware)
-    val CRP_FFF0_SERVICE_UUID: UUID = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
-    val CRP_FFF1_CHAR_UUID: UUID = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
-    val CRP_FFF2_CHAR_UUID: UUID = UUID.fromString("0000fff2-0000-1000-8000-00805f9b34fb")
+    private fun uuid16(short: String): UUID =
+        UUID.fromString("0000$short-0000-1000-8000-00805f9b34fb")
 
-    // 3. DaFit FEE7 Service
-    val CRP_FEE7_SERVICE_UUID: UUID = UUID.fromString("0000fee7-0000-1000-8000-00805f9b34fb")
-    val CRP_FEB1_CHAR_UUID: UUID = UUID.fromString("0000feb1-0000-1000-8000-00805f9b34fb")
-    val CRP_FEB2_CHAR_UUID: UUID = UUID.fromString("0000feb2-0000-1000-8000-00805f9b34fb")
+    // ---- Primary Crrepa data service ----
+    val CRP_SERVICE_FEEA: UUID = uuid16("feea")
+    /** Notifies live step data (`CRPStepInfo`, 3-byte little-endian triplets). */
+    val CRP_CHAR_FEE1: UUID = uuid16("fee1")
+    /** Default command write channel. */
+    val CRP_CHAR_FEE2: UUID = uuid16("fee2")
+    /** Main notify channel carrying framed packets (magic FE EA). Requirement for a valid device. */
+    val CRP_CHAR_FEE3: UUID = uuid16("fee3")
+    /** Write channel used only by command byte 0x01. */
+    val CRP_CHAR_FEE5: UUID = uuid16("fee5")
+    /** Write channel used only by command byte 0x02. */
+    val CRP_CHAR_FEE6: UUID = uuid16("fee6")
+    val CRP_CHAR_FEE7: UUID = uuid16("fee7")
+    val CRP_CHAR_FEE8: UUID = uuid16("fee8")
 
-    // 4. Crrepa DFU Service
-    val DFU_SERVICE_UUID: UUID = UUID.fromString("0000ffd0-0000-1000-8000-00805f9b34fb")
-    val DFU_TX_CHAR_UUID: UUID = UUID.fromString("0000ffd1-0000-1000-8000-00805f9b34fb")
-    val DFU_RX_CHAR_UUID: UUID = UUID.fromString("0000ffd2-0000-1000-8000-00805f9b34fb")
+    // ---- Standard services ----
+    val BATTERY_SERVICE: UUID = uuid16("180f")
+    val BATTERY_LEVEL_CHAR: UUID = uuid16("2a19")
 
-    // 5. HunterSun AE00 Service
-    val HS_AE00_SERVICE_UUID: UUID = UUID.fromString("0000ae00-0000-1000-8000-00805f9b34fb")
-    val HS_AE01_CHAR_UUID: UUID = UUID.fromString("0000ae01-0000-1000-8000-00805f9b34fb")
-    val HS_AE02_CHAR_UUID: UUID = UUID.fromString("0000ae02-0000-1000-8000-00805f9b34fb")
+    val HEART_RATE_SERVICE: UUID = uuid16("180d")
+    val HEART_RATE_MEASUREMENT_CHAR: UUID = uuid16("2a37")
 
-    // Standard Client Characteristic Configuration Descriptor (CCCD)
-    val CCCD_DESCRIPTOR_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    val DEVICE_INFO_SERVICE: UUID = uuid16("180a")
+    val MODEL_NUMBER_CHAR: UUID = uuid16("2a24")
+    val FIRMWARE_REVISION_CHAR: UUID = uuid16("2a28")
+    val MANUFACTURER_NAME_CHAR: UUID = uuid16("2a29")
+
+    /** Client Characteristic Configuration Descriptor (shared by every notifying characteristic). */
+    val CCCD: UUID = uuid16("2902")
 }

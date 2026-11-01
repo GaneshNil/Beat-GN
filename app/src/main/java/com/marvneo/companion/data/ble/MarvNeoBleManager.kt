@@ -1,251 +1,253 @@
 package com.marvneo.companion.data.ble
 
+import android.Manifest
 import android.annotation.SuppressLint
-import android.bluetooth.*
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothGattService
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
-import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
+import com.marvneo.companion.data.ble.protocol.CrrepaFrameAssembler
 import com.marvneo.companion.data.ble.protocol.CrrepaProtocol
-import com.marvneo.companion.data.db.AppDatabase
-import com.marvneo.companion.data.db.entity.BloodOxygenRecord
-import com.marvneo.companion.data.db.entity.BloodPressureRecord
-import com.marvneo.companion.data.db.entity.HeartRateRecord
+import com.marvneo.companion.data.db.dao.HealthDao
+import com.marvneo.companion.data.db.entity.AlarmRecord
 import com.marvneo.companion.data.db.entity.StepRecord
-import com.marvneo.companion.domain.model.AlarmModel
+import com.marvneo.companion.data.repository.HealthRepository
+import com.marvneo.companion.domain.model.CommandOutcome
 import com.marvneo.companion.domain.model.ConnectionState
 import com.marvneo.companion.domain.model.DiscoveredDevice
-import kotlinx.coroutines.*
+import com.marvneo.companion.domain.model.MeasurementState
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.util.UUID
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 
+/**
+ * Single owner of the BLE link with the watch.
+ *
+ * Rules enforced here:
+ *  1. **Serialised GATT operations.** Android allows one outstanding GATT request per connection.
+ *     Every write/read/descriptor-write goes through [runGattOp] and waits for its callback.
+ *  2. **No invented state.** [ConnectionState.Ready] is published only after service discovery,
+ *     notification subscription *and* a real application-level round trip (a battery read that
+ *     returned a plausible value). A successful `connectGatt()` call proves nothing.
+ *  3. **Chunked reassembly.** Inbound `FE EA` packets may arrive split across notifications; they
+ *     are reassembled before parsing, and only complete, valid frames become data.
+ *  4. **Measurements are never fabricated.** Heart rate comes from the standard 0x2A37
+ *     characteristic, SpO2 from opcode 0x6B and blood pressure from opcode 0x69. If the watch
+ *     never sends a reading, the state stays "not supported" / "timed out".
+ */
 @SuppressLint("MissingPermission")
-class MarvNeoBleManager(private val context: Context) {
+class MarvNeoBleManager(
+    private val context: Context,
+    private val healthRepository: HealthRepository,
+    private val healthDao: HealthDao
+) {
 
-    private val tag = "MarvNeoBleManager"
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    companion object {
+        private const val TAG = "WatchBleManager"
+        private const val MTU_REQUEST = 247
+        private const val GATT_OP_TIMEOUT_MS = 5_000L
+        private const val HANDSHAKE_TIMEOUT_MS = 6_000L
+        private const val MEASUREMENT_TIMEOUT_MS = 40_000L
+        private const val SPO2_TIMEOUT_MS = 45_000L
+        private const val BP_TIMEOUT_MS = 30_000L
+        private const val HEARTBEAT_INTERVAL_MS = 30_000L
+        private const val MAX_RECONNECT_ATTEMPTS = 5
+        private const val SCAN_DURATION_MS = 20_000L
+        private const val DIAGNOSTIC_LIMIT = 250
+        private const val POST_DISCOVERY_SETTLE_MS = 300L
+    }
 
-    private val prefs: SharedPreferences = context.getSharedPreferences("marv_neo_prefs", Context.MODE_PRIVATE)
-    private val database: AppDatabase = AppDatabase.getDatabase(context)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
-    private var bluetoothGatt: BluetoothGatt? = null
+    private val bluetoothManager =
+        context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+    private val adapter: BluetoothAdapter? = bluetoothManager?.adapter
 
-    private var txCharacteristic: BluetoothGattCharacteristic? = null
-    private var rxCharacteristic: BluetoothGattCharacteristic? = null
+    private var gatt: BluetoothGatt? = null
+    private var gattGeneration = 0
 
-    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected())
+    private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    private var packetCharacteristic: BluetoothGattCharacteristic? = null
+    private var heartRateCharacteristic: BluetoothGattCharacteristic? = null
+    private var stepCharacteristic: BluetoothGattCharacteristic? = null
+    private var batteryCharacteristic: BluetoothGattCharacteristic? = null
+
+    private var targetAddress: String? = null
+    private var userDisconnected = false
+    private var reconnectAttempt = 0
+
+    private var scanCallbackActive = false
+    private var scanTimeoutJob: Job? = null
+    private var connectTimeoutJob: Job? = null
+    private var reconnectJob: Job? = null
+    private var heartbeatJob: Job? = null
+    private var measurementTimeoutJob: Job? = null
+
+    // ---- Observable connection state ----
+    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
-    // Discovered & Bonded Devices
     private val _discoveredDevices = MutableStateFlow<List<DiscoveredDevice>>(emptyList())
     val discoveredDevices: StateFlow<List<DiscoveredDevice>> = _discoveredDevices.asStateFlow()
 
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
-    // Connected device metadata
+    private val _bluetoothEnabled = MutableStateFlow(adapter?.isEnabled == true)
+    val bluetoothEnabled: StateFlow<Boolean> = _bluetoothEnabled.asStateFlow()
+
     val connectedDeviceName = MutableStateFlow<String?>(null)
     val connectedDeviceAddress = MutableStateFlow<String?>(null)
     val lastCommunicationTimestamp = MutableStateFlow(0L)
+    val negotiatedMtu = MutableStateFlow(0)
+    val firmwareVersion = MutableStateFlow<String?>(null)
+    val modelNumber = MutableStateFlow<String?>(null)
+    val manufacturerName = MutableStateFlow<String?>(null)
 
-    // Telemetry StateFlows
+    // ---- Telemetry (0 = nothing received yet; never seeded with sample data) ----
     val stepsFlow = MutableStateFlow(0)
     val caloriesFlow = MutableStateFlow(0)
     val distanceFlow = MutableStateFlow(0)
     val heartRateFlow = MutableStateFlow(0)
     val spO2Flow = MutableStateFlow(0)
-    val bloodPressureFlow = MutableStateFlow<Pair<Int, Int>?>(null) // (systolic, diastolic)
-    val batteryFlow = MutableStateFlow(100)
+    val bloodPressureFlow = MutableStateFlow<Pair<Int, Int>?>(null)
+    val batteryFlow = MutableStateFlow(0)
+    val isChargingFlow = MutableStateFlow(false)
+    val batteryKnown = MutableStateFlow(false)
 
-    // Health Measurement StateFlows
-    val isMeasuringHeartRate = MutableStateFlow(false)
-    val isMeasuringSpO2 = MutableStateFlow(false)
-    val isMeasuringBloodPressure = MutableStateFlow(false)
+    // ---- Measurements ----
+    val heartRateMeasurement = MutableStateFlow<MeasurementState>(MeasurementState.Idle)
+    val spo2Measurement = MutableStateFlow<MeasurementState>(MeasurementState.Idle)
+    val bloodPressureMeasurement = MutableStateFlow<MeasurementState>(MeasurementState.Idle)
 
-    private val commandMutex = Mutex()
-    private var targetDeviceAddress: String? = null
-    private var reconnectAttempts = 0
-    private var isUserDisconnecting = false
+    /** True only once this install has received at least one real BP reading. */
+    val bloodPressureEverReported = MutableStateFlow(false)
 
-    private var connectionTimeoutJob: Job? = null
-    private var reconnectJob: Job? = null
-    private var scanTimeoutJob: Job? = null
-    private var keepAliveJob: Job? = null
+    // ---- Commands ----
+    val findWatchOutcome = MutableStateFlow<CommandOutcome>(CommandOutcome.Idle)
+    val alarmSyncOutcome = MutableStateFlow<CommandOutcome>(CommandOutcome.Idle)
+
+    // ---- Diagnostics (the evidence trail shown in the app) ----
+    private val _diagnostics = MutableStateFlow<List<String>>(emptyList())
+    val diagnostics: StateFlow<List<String>> = _diagnostics.asStateFlow()
+
+    private var alarmReplyDeferred: CompletableDeferred<CrrepaProtocol.Frame>? = null
+
+    private val gattOpMutex = Mutex()
+    private var pendingGattOp: CompletableDeferred<Boolean>? = null
+
+    /** Chunked inbound packet reassembly, mirroring `com.crrepa.l.a#n0`. */
+    private val rxAssembler = CrrepaFrameAssembler()
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
-            result?.let { handleScanResult(it) }
-        }
-
-        override fun onBatchScanResults(results: MutableList<ScanResult>?) {
-            results?.forEach { handleScanResult(it) }
+            result?.let(::handleScanResult)
         }
 
         override fun onScanFailed(errorCode: Int) {
-            Log.e(tag, "BLE Scan failed with error code: $errorCode")
+            log("Scan failed (error $errorCode)")
             _isScanning.value = false
-            _connectionState.value = ConnectionState.ConnectionFailed("BLE Scan failed (Code $errorCode)")
+            _connectionState.value = ConnectionState.Failed("Bluetooth scan failed (code $errorCode)")
         }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            Log.d(tag, "onConnectionStateChange: status=$status, newState=$newState")
-            connectionTimeoutJob?.cancel()
 
-            if (status != BluetoothGatt.GATT_SUCCESS && newState != BluetoothProfile.STATE_CONNECTED) {
-                Log.w(tag, "GATT connection failed with status $status. Cleaning up...")
-                cleanup()
-                _connectionState.value = ConnectionState.Disconnected("GATT disconnected (Status $status)")
-                if (!isUserDisconnecting) {
-                    scheduleReconnect()
-                }
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (gatt !== this@MarvNeoBleManager.gatt) {
+                runCatching { gatt.close() } // stale callback from an earlier connection
+                return
+            }
+            log("onConnectionStateChange status=$status newState=$newState")
+
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                completeGattOp(false)
+                handleLinkLost("GATT error $status")
                 return
             }
 
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.i(tag, "GATT connected. Requesting MTU 512...")
-                    _connectionState.value = ConnectionState.Synchronizing("Negotiating MTU buffer...")
-                    reconnectAttempts = 0
-                    isUserDisconnecting = false
-                    gatt.requestMtu(512)
+                    connectTimeoutJob?.cancel()
+                    _connectionState.value = ConnectionState.DiscoveringServices(gatt.device.address)
+                    scope.launch { initialiseConnection() }
                 }
+
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    Log.w(tag, "GATT disconnected cleanly. Cleaning up...")
-                    cleanup()
-                    _connectionState.value = ConnectionState.Disconnected("Device disconnected")
-                    if (!isUserDisconnecting) {
-                        scheduleReconnect()
-                    }
+                    completeGattOp(false)
+                    handleLinkLost("Disconnected by device")
                 }
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            Log.i(tag, "MTU changed to $mtu (status: $status). Discovering GATT services...")
-            _connectionState.value = ConnectionState.Synchronizing("Discovering smartwatch services...")
-            gatt.discoverServices()
+            val effective = if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23
+            negotiatedMtu.value = effective
+            log("MTU now $effective (status $status)")
+            completeGattOp(true)
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            log("onServicesDiscovered status=$status (${gatt.services.size} services)")
+            completeGattOp(status == BluetoothGatt.GATT_SUCCESS)
+        }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            log("CCCD write ${descriptor.characteristic.uuid} status=$status")
+            completeGattOp(status == BluetoothGatt.GATT_SUCCESS)
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            completeGattOp(status == BluetoothGatt.GATT_SUCCESS)
+        }
+
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                var foundTx: BluetoothGattCharacteristic? = null
-                var foundRx: BluetoothGattCharacteristic? = null
-
-                // Phase 1: Known Crrepa / DaFit / HunterSun UUID candidate matching
-                val knownServices = listOf(
-                    BleGattAttributes.CRP_FFF0_SERVICE_UUID,
-                    BleGattAttributes.CRP_FEE7_SERVICE_UUID,
-                    BleGattAttributes.NUS_SERVICE_UUID,
-                    BleGattAttributes.HS_AE00_SERVICE_UUID,
-                    BleGattAttributes.DFU_SERVICE_UUID,
-                    UUID.fromString("c6a22920-f821-18bf-9704-0266f20e80fd"),
-                    UUID.fromString("000034f1-0000-1000-8000-00805f9b34fb")
-                )
-
-                for (srvUuid in knownServices) {
-                    val srv = gatt.getService(srvUuid) ?: continue
-                    for (char in srv.characteristics) {
-                        val props = char.properties
-                        if (foundTx == null && (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
-                                    props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)) {
-                            foundTx = char
-                        }
-                        if (foundRx == null && (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 ||
-                                    props and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)) {
-                            foundRx = char
-                        }
-                    }
-                    if (foundTx != null && foundRx != null) {
-                        Log.i(tag, "Resolved TX/RX via candidate service: $srvUuid")
-                        break
-                    }
-                }
-
-                // Phase 2: Dynamic fallback across all discovered non-standard services
-                if (foundTx == null || foundRx == null) {
-                    Log.w(tag, "Candidate service not found. Running dynamic non-standard GATT scan...")
-                    for (srv in gatt.services) {
-                        val srvUuidStr = srv.uuid.toString().lowercase()
-                        if (srvUuidStr.startsWith("00001800") || srvUuidStr.startsWith("00001801") || srvUuidStr.startsWith("0000180a")) {
-                            continue
-                        }
-                        for (char in srv.characteristics) {
-                            val props = char.properties
-                            if (foundTx == null && (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
-                                        props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)) {
-                                foundTx = char
-                            }
-                            if (foundRx == null && (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 ||
-                                        props and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)) {
-                                foundRx = char
-                            }
-                        }
-                        if (foundTx != null && foundRx != null) {
-                            Log.i(tag, "Resolved TX/RX dynamically from service: ${srv.uuid}")
-                            break
-                        }
-                    }
-                }
-
-                if (foundTx != null && foundRx != null) {
-                    txCharacteristic = foundTx
-                    rxCharacteristic = foundRx
-
-                    _connectionState.value = ConnectionState.Synchronizing("Enabling telemetry notifications...")
-                    enableNotifications(gatt, rxCharacteristic)
-
-                    val device = gatt.device
-                    val name = device.name ?: "beatXP Marv Neo"
-                    connectedDeviceName.value = name
-                    connectedDeviceAddress.value = device.address
-
-                    prefs.edit()
-                        .putString("last_device_address", device.address)
-                        .putString("last_device_name", name)
-                        .apply()
-
-                    // Perform initial handshake before declaring full Connected state
-                    scope.launch {
-                        delay(300)
-                        val timeSynced = sendCommand(CrrepaProtocol.createTimeSyncPacket())
-                        delay(200)
-                        val battQueried = sendCommand(CrrepaProtocol.createBatteryQueryPacket())
-                        delay(200)
-                        sendCommand(CrrepaProtocol.createStepsQueryPacket())
-
-                        if (timeSynced || battQueried) {
-                            val now = System.currentTimeMillis()
-                            lastCommunicationTimestamp.value = now
-                            _connectionState.value = ConnectionState.Connected(
-                                deviceName = name,
-                                deviceAddress = device.address,
-                                lastSeenMs = now
-                            )
-                            startKeepAlive()
-                            Log.i(tag, "GATT communication verified. Watch is genuinely connected.")
-                        } else {
-                            _connectionState.value = ConnectionState.ConnectionUnstable("Initial packet handshake unacknowledged")
-                        }
-                    }
-                } else {
-                    Log.e(tag, "Failed to resolve GATT TX/RX characteristics.")
-                    _connectionState.value = ConnectionState.ConnectionFailed("Smartwatch data channels could not be resolved")
-                    cleanup()
-                }
+                handleReadValue(characteristic, value)
+                completeGattOp(true)
             } else {
-                Log.e(tag, "Service discovery failed with status $status")
-                _connectionState.value = ConnectionState.ConnectionFailed("GATT service discovery error ($status)")
-                cleanup()
+                log("Read ${characteristic.uuid} failed status=$status")
+                completeGattOp(false)
             }
         }
 
@@ -254,509 +256,1001 @@ class MarvNeoBleManager(private val context: Context) {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            handleIncomingPacket(value)
+            handleNotification(characteristic, value)
         }
 
         @Deprecated("Deprecated in Java")
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            handleIncomingPacket(characteristic.value)
-        }
-    }
-
-    init {
-        refreshBondedDevices()
-    }
-
-    fun isSmartwatchDevice(device: BluetoothDevice): Boolean {
-        val lastAddress = prefs.getString("last_device_address", null)
-        if (!lastAddress.isNullOrBlank() && device.address.equals(lastAddress, ignoreCase = true)) {
-            return true
-        }
-
-        val name = device.name ?: ""
-        if (name.contains("Marv", ignoreCase = true) ||
-            name.contains("beatXP", ignoreCase = true) ||
-            name.contains("MOY", ignoreCase = true) ||
-            name.contains("Watch", ignoreCase = true) ||
-            name.contains("Band", ignoreCase = true)
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
         ) {
-            return true
+            @Suppress("DEPRECATION")
+            characteristic.value?.let { handleNotification(characteristic, it) }
         }
-
-        val deviceClass = device.bluetoothClass?.majorDeviceClass
-        if (deviceClass == BluetoothClass.Device.Major.WEARABLE ||
-            deviceClass == BluetoothClass.Device.Major.HEALTH
-        ) {
-            return true
-        }
-
-        return false
     }
 
-    fun autoConnect(): Boolean {
-        val adapter = bluetoothAdapter ?: run {
-            _connectionState.value = ConnectionState.BluetoothDisabled
-            return false
-        }
-        if (!adapter.isEnabled) {
-            _connectionState.value = ConnectionState.BluetoothDisabled
-            return false
-        }
+    // ------------------------------------------------------------------ permissions
 
-        val gattConnected = bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
-        val connectedWatch = gattConnected.firstOrNull { isSmartwatchDevice(it) }
-        if (connectedWatch != null) {
-            Log.i(tag, "Auto-connecting to active GATT watch: ${connectedWatch.name} (${connectedWatch.address})")
-            connect(connectedWatch.address)
-            return true
-        }
-
-        val lastAddress = prefs.getString("last_device_address", null)
-        if (!lastAddress.isNullOrBlank()) {
-            Log.i(tag, "Auto-connecting to saved address: $lastAddress")
-            connect(lastAddress)
-            return true
-        }
-
-        val bonded = adapter.bondedDevices
-        val bondedWatch = bonded?.firstOrNull { isSmartwatchDevice(it) }
-        if (bondedWatch != null) {
-            Log.i(tag, "Auto-connecting to bonded watch: ${bondedWatch.name} (${bondedWatch.address})")
-            connect(bondedWatch.address)
-            return true
-        }
-
-        return false
+    fun requiredPermissions(): Array<String> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+    } else {
+        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
     }
 
-    fun refreshBondedDevices() {
-        val adapter = bluetoothAdapter ?: return
-        if (!adapter.isEnabled) {
-            _connectionState.value = ConnectionState.BluetoothDisabled
-            return
-        }
-
-        val bonded = adapter.bondedDevices ?: return
-        val currentList = _discoveredDevices.value.toMutableList()
-
-        for (device in bonded) {
-            val name = device.name ?: "Bluetooth Device"
-            val address = device.address
-            val existingIndex = currentList.indexOfFirst { it.address == address }
-            val item = DiscoveredDevice(
-                name = name,
-                address = address,
-                rssi = -50,
-                isBonded = true
-            )
-            if (existingIndex >= 0) {
-                currentList[existingIndex] = item
-            } else {
-                if (isSmartwatchDevice(device)) {
-                    currentList.add(0, item)
-                } else {
-                    currentList.add(item)
-                }
-            }
-        }
-        _discoveredDevices.value = currentList
+    fun hasPermissions(): Boolean = requiredPermissions().all {
+        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
+
+    // ------------------------------------------------------------------ lifecycle
+
+    fun refreshAdapterState() {
+        val enabled = adapter?.isEnabled == true
+        _bluetoothEnabled.value = enabled
+        if (!enabled && _connectionState.value !is ConnectionState.Ready) {
+            _connectionState.value = ConnectionState.BluetoothOff
+        }
+    }
+
+    fun onBluetoothTurnedOff() {
+        log("Bluetooth turned off")
+        stopScan()
+        userDisconnected = true
+        closeGatt()
+        _connectionState.value = ConnectionState.BluetoothOff
+        _bluetoothEnabled.value = false
+    }
+
+    fun onBluetoothTurnedOn() {
+        _bluetoothEnabled.value = true
+        if (_connectionState.value is ConnectionState.BluetoothOff) {
+            _connectionState.value = ConnectionState.Idle
+        }
+        userDisconnected = false
+        autoConnect()
+    }
+
+    // ------------------------------------------------------------------ scanning
 
     fun startScan() {
-        val adapter = bluetoothAdapter ?: run {
-            _connectionState.value = ConnectionState.BluetoothDisabled
+        if (!hasPermissions()) {
+            _connectionState.value =
+                ConnectionState.Failed("Bluetooth permission not granted", retryable = false)
+            return
+        }
+        val adapter = adapter ?: run {
+            _connectionState.value = ConnectionState.BluetoothOff
             return
         }
         if (!adapter.isEnabled) {
-            _connectionState.value = ConnectionState.BluetoothDisabled
+            _connectionState.value = ConnectionState.BluetoothOff
+            return
+        }
+        val scanner = adapter.bluetoothLeScanner ?: run {
+            _connectionState.value = ConnectionState.Failed("BLE scanner unavailable", retryable = false)
             return
         }
 
-        refreshBondedDevices()
+        if (_isScanning.value) stopScan()
 
-        val scanner = adapter.bluetoothLeScanner
-        if (scanner == null) {
-            _connectionState.value = ConnectionState.ConnectionFailed("Bluetooth LE scanner unavailable")
-            return
-        }
-
-        if (_isScanning.value) {
-            stopScan()
-        }
-
+        _discoveredDevices.value = emptyList()
         _isScanning.value = true
-        _connectionState.value = ConnectionState.SearchingForWatch
+        _connectionState.value = ConnectionState.Scanning()
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
 
         try {
             scanner.startScan(null, settings, scanCallback)
-            Log.i(tag, "BLE Scan started.")
-
-            scanTimeoutJob?.cancel()
-            scanTimeoutJob = scope.launch {
-                delay(15_000)
-                stopScan()
-                if (_connectionState.value is ConnectionState.SearchingForWatch) {
-                    _connectionState.value = ConnectionState.Disconnected("Scan timed out. Watch not found.")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "Error starting BLE scan", e)
+            scanCallbackActive = true
+            log("BLE scan started")
+        } catch (e: SecurityException) {
             _isScanning.value = false
-            _connectionState.value = ConnectionState.ConnectionFailed("Failed to start BLE scan: ${e.message}")
+            _connectionState.value = ConnectionState.Failed("Bluetooth permission revoked", retryable = false)
+            return
+        } catch (e: Exception) {
+            _isScanning.value = false
+            _connectionState.value = ConnectionState.Failed("Could not start scan: ${e.message}")
+            return
+        }
+
+        scanTimeoutJob?.cancel()
+        scanTimeoutJob = scope.launch {
+            delay(SCAN_DURATION_MS)
+            stopScan()
+            if (_connectionState.value is ConnectionState.Scanning) {
+                _connectionState.value = ConnectionState.Disconnected
+                log("Scan finished without connecting")
+            }
         }
     }
 
     fun stopScan() {
         scanTimeoutJob?.cancel()
-        if (_isScanning.value) {
-            try {
-                bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
-            } catch (e: Exception) {
-                Log.e(tag, "Error stopping BLE scan", e)
-            }
-            _isScanning.value = false
+        if (scanCallbackActive) {
+            runCatching { adapter?.bluetoothLeScanner?.stopScan(scanCallback) }
+            scanCallbackActive = false
         }
+        _isScanning.value = false
     }
 
     private fun handleScanResult(result: ScanResult) {
         val device = result.device ?: return
-        val record = result.scanRecord
-        val name = device.name ?: record?.deviceName
-
+        val name = result.scanRecord?.deviceName ?: runCatching { device.name }.getOrNull()
         if (name.isNullOrBlank()) return
 
-        val address = device.address
-        val rssi = result.rssi
+        val record = DiscoveredDevice(
+            name = name,
+            address = device.address,
+            rssi = result.rssi,
+            isBonded = device.bondState == BluetoothDevice.BOND_BONDED,
+            likelyWatch = looksLikeWatch(name, device)
+        )
 
-        val currentList = _discoveredDevices.value.toMutableList()
-        val existingIndex = currentList.indexOfFirst { it.address == address }
+        val current = _discoveredDevices.value.toMutableList()
+        val index = current.indexOfFirst { it.address == record.address }
+        if (index >= 0) current[index] = record else current.add(record)
+        current.sortWith(
+            compareByDescending<DiscoveredDevice> { it.likelyWatch }
+                .thenByDescending { it.isBonded }
+                .thenByDescending { it.rssi }
+        )
+        _discoveredDevices.value = current
 
-        val isBonded = device.bondState == BluetoothDevice.BOND_BONDED
-        val discovered = DiscoveredDevice(name = name, address = address, rssi = rssi, isBonded = isBonded)
-
-        if (existingIndex >= 0) {
-            currentList[existingIndex] = discovered
-        } else {
-            if (isSmartwatchDevice(device)) {
-                currentList.add(0, discovered)
-                if (_connectionState.value is ConnectionState.SearchingForWatch) {
-                    _connectionState.value = ConnectionState.WatchFound(name, address, rssi)
-                }
-            } else {
-                currentList.add(discovered)
-            }
+        if (record.likelyWatch && _connectionState.value is ConnectionState.Scanning) {
+            _connectionState.value = ConnectionState.WatchFound(name, device.address, result.rssi)
         }
-        _discoveredDevices.value = currentList
     }
 
-    fun connect(macAddress: String) {
-        if (macAddress.isBlank()) return
-        val adapter = bluetoothAdapter ?: run {
-            _connectionState.value = ConnectionState.BluetoothDisabled
+    /** Name/class heuristics. Used only to sort and highlight scan results. */
+    fun looksLikeWatch(name: String, device: BluetoothDevice? = null): Boolean {
+        val normalized = name.lowercase()
+        val nameMatch = listOf("marv", "beatxp", "beat xp", "moy", "watch", "band", "smart")
+            .any { normalized.contains(it) }
+        if (nameMatch) return true
+        val major = runCatching { device?.bluetoothClass?.majorDeviceClass }.getOrNull()
+        return major == android.bluetooth.BluetoothClass.Device.Major.WEARABLE
+    }
+
+    fun lastKnownAddress(): String? =
+        prefs().getString("last_device_address", null)
+
+    fun lastKnownName(): String? =
+        prefs().getString("last_device_name", null)
+
+    private fun prefs() = context.getSharedPreferences("marv_neo_prefs", Context.MODE_PRIVATE)
+
+    // ------------------------------------------------------------------ connection
+
+    /** Connects to the last known watch, or to a bonded watch, without scanning. */
+    fun autoConnect(): Boolean {
+        if (!hasPermissions()) return false
+        val adapter = adapter ?: return false
+        if (!adapter.isEnabled) {
+            _connectionState.value = ConnectionState.BluetoothOff
+            return false
+        }
+        if (_connectionState.value.inProgress()) return true
+
+        val saved = lastKnownAddress()
+        if (!saved.isNullOrBlank()) {
+            connect(saved)
+            return true
+        }
+
+        val bonded = runCatching {
+            adapter.bondedDevices?.firstOrNull { looksLikeWatch(it.name ?: "", it) }
+        }.getOrNull()
+        if (bonded != null) {
+            connect(bonded.address)
+            return true
+        }
+        return false
+    }
+
+    private fun ConnectionState.inProgress(): Boolean = when (this) {
+        is ConnectionState.Ready,
+        is ConnectionState.Connecting,
+        is ConnectionState.DiscoveringServices,
+        is ConnectionState.Subscribing,
+        is ConnectionState.VerifyingLink -> true
+        else -> false
+    }
+
+    fun connect(address: String) {
+        if (address.isBlank()) return
+        if (!hasPermissions()) {
+            _connectionState.value =
+                ConnectionState.Failed("Bluetooth permission not granted", retryable = false)
+            return
+        }
+        val adapter = adapter ?: run {
+            _connectionState.value = ConnectionState.BluetoothOff
             return
         }
         if (!adapter.isEnabled) {
-            _connectionState.value = ConnectionState.BluetoothDisabled
+            _connectionState.value = ConnectionState.BluetoothOff
             return
         }
 
-        targetDeviceAddress = macAddress
-        isUserDisconnecting = false
-        reconnectJob?.cancel()
-
         val device = try {
-            adapter.getRemoteDevice(macAddress)
-        } catch (e: Exception) {
-            Log.e(tag, "Invalid MAC format: $macAddress", e)
-            _connectionState.value = ConnectionState.ConnectionFailed("Invalid MAC address: $macAddress")
+            adapter.getRemoteDevice(address)
+        } catch (e: IllegalArgumentException) {
+            _connectionState.value = ConnectionState.Failed("Invalid Bluetooth address", retryable = false)
+            return
+        }
+
+        if (address.equals(connectedDeviceAddress.value, ignoreCase = true) && gatt != null) {
+            log("Already handling $address; ignoring duplicate connect")
             return
         }
 
         stopScan()
-        cleanup()
+        userDisconnected = false
+        targetAddress = address
+        reconnectAttempt = 0
+        reconnectJob?.cancel()
 
-        _connectionState.value = ConnectionState.Connecting("Connecting to ${device.name ?: macAddress}...")
-        connectedDeviceAddress.value = macAddress
-        connectedDeviceName.value = device.name ?: "beatXP Marv Neo"
+        closeGatt()
+        // Verification must be earned by this session, not inherited from a previous one.
+        batteryKnown.value = false
+        batteryFlow.value = 0
+        val generation = ++gattGeneration
 
-        connectionTimeoutJob?.cancel()
-        connectionTimeoutJob = scope.launch {
+        val name = runCatching { device.name }.getOrNull() ?: "Smartwatch"
+        connectedDeviceName.value = name
+        connectedDeviceAddress.value = address
+        _connectionState.value = ConnectionState.Connecting(name, address)
+        log("Connecting to $name ($address)")
+
+        connectTimeoutJob?.cancel()
+        connectTimeoutJob = scope.launch {
             delay(15_000)
-            if (_connectionState.value is ConnectionState.Connecting ||
-                _connectionState.value is ConnectionState.Synchronizing
-            ) {
-                Log.w(tag, "Connection timed out after 15s. Resetting state.")
-                _connectionState.value = ConnectionState.ConnectionFailed("Connection timed out after 15s")
-                cleanup()
+            if (generation == gattGeneration && _connectionState.value !is ConnectionState.Ready) {
+                log("Connect timed out")
+                handleLinkLost("Connection timed out")
             }
         }
 
         try {
-            bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        } catch (e: SecurityException) {
+            gatt = null
+            _connectionState.value = ConnectionState.Failed("Bluetooth permission revoked", retryable = false)
         } catch (e: Exception) {
-            Log.e(tag, "connectGatt error", e)
-            _connectionState.value = ConnectionState.ConnectionFailed("GATT link error: ${e.message}")
-            cleanup()
+            gatt = null
+            _connectionState.value = ConnectionState.Failed("Could not open GATT link: ${e.message}")
         }
     }
 
     fun disconnect() {
-        isUserDisconnecting = true
-        targetDeviceAddress = null
+        userDisconnected = true
+        targetAddress = null
         reconnectJob?.cancel()
-        connectionTimeoutJob?.cancel()
-        keepAliveJob?.cancel()
-
-        _connectionState.value = ConnectionState.Disconnected("Disconnected by user")
-
-        try {
-            bluetoothGatt?.disconnect()
-        } catch (e: Exception) {
-            Log.e(tag, "disconnect error", e)
-        }
-        cleanup()
+        connectTimeoutJob?.cancel()
+        heartbeatJob?.cancel()
+        stopScan()
+        log("User disconnected")
+        runCatching { gatt?.disconnect() }
+        closeGatt()
+        _connectionState.value = ConnectionState.Disconnected
     }
 
     fun forgetDevice() {
-        prefs.edit().remove("last_device_address").remove("last_device_name").apply()
+        prefs().edit().remove("last_device_address").remove("last_device_name").apply()
         disconnect()
     }
 
-    suspend fun sendCommand(packet: ByteArray): Boolean = commandMutex.withLock {
-        val gatt = bluetoothGatt ?: return false
-        val char = txCharacteristic ?: return false
+    private suspend fun initialiseConnection() {
+        val gatt = gatt ?: return
+        val generation = gattGeneration
 
-        char.value = packet
-        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-        val success = gatt.writeCharacteristic(char)
-        if (success) {
-            lastCommunicationTimestamp.value = System.currentTimeMillis()
+        // 1. MTU. A failure here is not fatal; 23-byte packets still work.
+        runGattOp(GATT_OP_TIMEOUT_MS) { gatt.requestMtu(MTU_REQUEST) }
+        if (generation != gattGeneration) return
+        // The reference SDK waits before discovery after a connection is established.
+        delay(POST_DISCOVERY_SETTLE_MS)
+
+        // 2. Service discovery.
+        _connectionState.value = ConnectionState.DiscoveringServices(gatt.device.address)
+        val discovered = runGattOp(GATT_OP_TIMEOUT_MS) { gatt.discoverServices() }
+        if (!discovered) {
+            _connectionState.value = ConnectionState.Failed("Service discovery failed")
+            handleLinkLost("Service discovery failed")
+            return
         }
-        delay(35)
-        return success
-    }
+        if (generation != gattGeneration) return
 
-    // Health Sensor Measurement Operations
-    suspend fun startHeartRateMeasurement(): Boolean {
-        isMeasuringHeartRate.value = true
-        val packet = CrrepaProtocol.createHeartRateControlPacket(true)
-        val sent = sendCommand(packet)
-        if (!sent) isMeasuringHeartRate.value = false
-        return sent
-    }
-
-    suspend fun stopHeartRateMeasurement(): Boolean {
-        isMeasuringHeartRate.value = false
-        val packet = CrrepaProtocol.createHeartRateControlPacket(false)
-        return sendCommand(packet)
-    }
-
-    suspend fun startSpO2Measurement(): Boolean {
-        isMeasuringSpO2.value = true
-        val packet = CrrepaProtocol.createSpO2ControlPacket(true)
-        val sent = sendCommand(packet)
-        if (!sent) isMeasuringSpO2.value = false
-        return sent
-    }
-
-    suspend fun stopSpO2Measurement(): Boolean {
-        isMeasuringSpO2.value = false
-        val packet = CrrepaProtocol.createSpO2ControlPacket(false)
-        return sendCommand(packet)
-    }
-
-    suspend fun startBloodPressureMeasurement(): Boolean {
-        isMeasuringBloodPressure.value = true
-        val packet = CrrepaProtocol.createBloodPressureControlPacket(true)
-        val sent = sendCommand(packet)
-        if (!sent) isMeasuringBloodPressure.value = false
-        return sent
-    }
-
-    suspend fun stopBloodPressureMeasurement(): Boolean {
-        isMeasuringBloodPressure.value = false
-        val packet = CrrepaProtocol.createBloodPressureControlPacket(false)
-        return sendCommand(packet)
-    }
-
-    suspend fun findWatch(enable: Boolean): Boolean {
-        val packet = CrrepaProtocol.createFindWatchPacket(enable)
-        return sendCommand(packet)
-    }
-
-    suspend fun sendAlarm(alarm: AlarmModel): Boolean {
-        val packet = CrrepaProtocol.createAlarmPacket(
-            id = alarm.id,
-            isEnabled = alarm.isEnabled,
-            repeatDaysMask = alarm.repeatDaysMask,
-            hour = alarm.hour,
-            minute = alarm.minute
-        )
-        return sendCommand(packet)
-    }
-
-    suspend fun flashBinaryChunks(
-        chunks: List<ByteArray>,
-        onProgress: (Float) -> Unit
-    ): Boolean {
-        if (_connectionState.value !is ConnectionState.Connected) return false
-        val total = chunks.size
-        for (i in chunks.indices) {
-            val chunk = chunks[i]
-            val success = sendCommand(chunk)
-            if (!success) {
-                delay(30)
-                sendCommand(chunk)
-            }
-            onProgress((i + 1).toFloat() / total.toFloat())
-            delay(15)
-        }
-        return true
-    }
-
-    private fun enableNotifications(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic?) {
-        if (characteristic == null) return
-        gatt.setCharacteristicNotification(characteristic, true)
-        val descriptor = characteristic.getDescriptor(BleGattAttributes.CCCD_DESCRIPTOR_UUID)
-        if (descriptor != null) {
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            gatt.writeDescriptor(descriptor)
-        }
-    }
-
-    private fun handleIncomingPacket(data: ByteArray) {
-        if (data.isEmpty()) return
-        val now = System.currentTimeMillis()
-        lastCommunicationTimestamp.value = now
-
-        // Check if framed packet: [0xFE, 0xEA, version, len, opcode, payload...]
-        val opcode = if (data.size >= 5 && data[0] == CrrepaProtocol.MAGIC_BYTE_0 && data[1] == CrrepaProtocol.MAGIC_BYTE_1) {
-            data[4]
-        } else {
-            data[0]
-        }
-
-        when (opcode) {
-            CrrepaProtocol.CMD_QUERY_STEPS -> {
-                CrrepaProtocol.parseSteps(data)?.let {
-                    stepsFlow.value = it.steps
-                    caloriesFlow.value = it.calories
-                    distanceFlow.value = it.distanceMeters
-                    scope.launch {
-                        database.healthDao().insertStep(
-                            StepRecord(
-                                timestamp = now,
-                                steps = it.steps,
-                                calories = it.calories,
-                                distanceMeters = it.distanceMeters
-                            )
-                        )
-                    }
-                }
-            }
-            CrrepaProtocol.CMD_QUERY_BATTERY -> {
-                CrrepaProtocol.parseBattery(data)?.let {
-                    batteryFlow.value = it.percentage
-                }
-            }
-            CrrepaProtocol.CMD_HEART_RATE_ONCE -> {
-                CrrepaProtocol.parseHeartRate(data)?.let {
-                    if (it.bpm > 0) {
-                        heartRateFlow.value = it.bpm
-                        isMeasuringHeartRate.value = false
-                        scope.launch {
-                            database.healthDao().insertHeartRate(
-                                HeartRateRecord(timestamp = now, bpm = it.bpm)
-                            )
-                        }
-                    }
-                }
-            }
-            CrrepaProtocol.CMD_BLOOD_OXYGEN -> {
-                CrrepaProtocol.parseSpO2(data)?.let {
-                    if (it.percentage > 0) {
-                        spO2Flow.value = it.percentage
-                        isMeasuringSpO2.value = false
-                        scope.launch {
-                            database.healthDao().insertBloodOxygen(
-                                BloodOxygenRecord(timestamp = now, percentage = it.percentage)
-                            )
-                        }
-                    }
-                }
-            }
-            CrrepaProtocol.CMD_BLOOD_PRESSURE -> {
-                CrrepaProtocol.parseBloodPressure(data)?.let {
-                    if (it.systolic > 0 && it.diastolic > 0) {
-                        bloodPressureFlow.value = Pair(it.systolic, it.diastolic)
-                        isMeasuringBloodPressure.value = false
-                        scope.launch {
-                            database.healthDao().insertBloodPressure(
-                                BloodPressureRecord(
-                                    timestamp = now,
-                                    systolic = it.systolic,
-                                    diastolic = it.diastolic
-                                )
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private fun startKeepAlive() {
-        keepAliveJob?.cancel()
-        keepAliveJob = scope.launch {
-            while (isActive && _connectionState.value is ConnectionState.Connected) {
-                delay(35_000) // 35s keep-alive interval
-                val success = sendCommand(CrrepaProtocol.createBatteryQueryPacket())
-                if (!success) {
-                    val timeSinceLast = System.currentTimeMillis() - lastCommunicationTimestamp.value
-                    if (timeSinceLast > 60_000) {
-                        Log.w(tag, "Keep-alive ping failed. Watch communication unstable.")
-                        _connectionState.value = ConnectionState.ConnectionUnstable("No packet response for >60s")
-                    }
-                }
-            }
-        }
-    }
-
-    private fun scheduleReconnect() {
-        val address = targetDeviceAddress ?: return
-        if (isUserDisconnecting) return
-
-        reconnectAttempts++
-        if (reconnectAttempts > 5) {
-            _connectionState.value = ConnectionState.ConnectionFailed("Reconnect limit reached (5 attempts)")
+        // 3. Resolve the Crrepa data channel.
+        val service = gatt.getService(BleGattAttributes.CRP_SERVICE_FEEA)
+        if (service == null) {
+            log("Device does not expose the Crrepa FEEA service")
+            _connectionState.value = ConnectionState.Failed(
+                "Not a supported watch: the Crrepa data service (FEEA) is missing",
+                retryable = false
+            )
+            closeGatt()
             return
         }
 
-        val delayMs = minOf(30000L, 1000L * (1 shl reconnectAttempts))
-        _connectionState.value = ConnectionState.Reconnecting(reconnectAttempts, 5)
+        fun char(uuid: java.util.UUID) = service.getCharacteristic(uuid)
 
-        reconnectJob = scope.launch {
-            Log.i(tag, "Scheduling reconnect attempt $reconnectAttempts in ${delayMs}ms...")
-            delay(delayMs)
-            if (targetDeviceAddress != null && !isUserDisconnecting) {
-                connect(address)
+        val fee1 = char(BleGattAttributes.CRP_CHAR_FEE1)
+        val fee2 = char(BleGattAttributes.CRP_CHAR_FEE2)
+        val fee3 = char(BleGattAttributes.CRP_CHAR_FEE3)
+
+        if (fee1 == null || fee2 == null || fee3 == null) {
+            // The vendor SDK treats a device as valid only when FEE1, FEE2 and FEE3 all exist.
+            log("FEEA present but FEE1/FEE2/FEE3 incomplete")
+            _connectionState.value = ConnectionState.Failed(
+                "Watch data channel incomplete (FEE1/FEE2/FEE3)",
+                retryable = false
+            )
+            closeGatt()
+            return
+        }
+
+        writeCharacteristic = fee2
+        packetCharacteristic = fee3
+        stepCharacteristic = fee1
+        heartRateCharacteristic = gatt
+            .getService(BleGattAttributes.HEART_RATE_SERVICE)
+            ?.getCharacteristic(BleGattAttributes.HEART_RATE_MEASUREMENT_CHAR)
+        batteryCharacteristic = gatt
+            .getService(BleGattAttributes.BATTERY_SERVICE)
+            ?.getCharacteristic(BleGattAttributes.BATTERY_LEVEL_CHAR)
+
+        // 4. Subscribe to the characteristics the vendor SDK subscribes to.
+        val subscriptions = listOfNotNull(fee3, heartRateCharacteristic, fee1)
+        for (characteristic in subscriptions) {
+            _connectionState.value = ConnectionState.Subscribing(
+                gatt.device.address,
+                characteristic.uuid.toString()
+            )
+            val ok = enableNotifications(gatt, characteristic)
+            if (!ok) {
+                log("Could not subscribe to ${characteristic.uuid}")
+            }
+            if (generation != gattGeneration) return
+        }
+
+        if (packetCharacteristic?.let { startedNotify(it) } != true) {
+            _connectionState.value = ConnectionState.Failed(
+                "Could not subscribe to the watch data channel",
+                retryable = true
+            )
+            handleLinkLost("Packet channel subscribe failed")
+            return
+        }
+
+        // 5. Application-level verification: read the standard battery characteristic.
+        _connectionState.value = ConnectionState.VerifyingLink(gatt.device.address)
+        val verified = verifyLink()
+        if (generation != gattGeneration) return
+
+        if (!verified) {
+            log("Handshake read did not confirm the link")
+            _connectionState.value = ConnectionState.Unstable(
+                reason = "Connected, but the watch did not answer a read request",
+                lastVerifiedAt = null,
+                connected = true
+            )
+            scope.launch {
+                repeat(3) {
+                    delay(4_000)
+                    if (_connectionState.value is ConnectionState.Ready) return@launch
+                    if (verifyLink()) {
+                        publishReady(gatt)
+                        return@launch
+                    }
+                }
+            }
+            return
+        }
+
+        publishReady(gatt)
+    }
+
+    /** Publishes the only state that may be called "connected": a verified round trip. */
+    private fun publishReady(gatt: BluetoothGatt) {
+        val now = System.currentTimeMillis()
+        lastCommunicationTimestamp.value = now
+        reconnectAttempt = 0
+        val name = connectedDeviceName.value ?: "Smartwatch"
+        val address = connectedDeviceAddress.value ?: gatt.device.address
+        prefs().edit()
+            .putString("last_device_address", address)
+            .putString("last_device_name", name)
+            .apply()
+
+        _connectionState.value = ConnectionState.Ready(
+            deviceName = name,
+            deviceAddress = address,
+            protocolName = "Crrepa FEEA (0x${CrrepaProtocol.VERSION_1.toString(16)})",
+            mtu = negotiatedMtu.value.coerceAtLeast(23),
+            lastVerifiedAt = now
+        )
+        log("Link verified by battery read; state=Ready")
+
+        startHeartbeat()
+        syncTime()
+        readDeviceInformation()
+        readBattery()
+    }
+
+    private var notifyConfirmed: MutableSet<java.util.UUID> = mutableSetOf()
+
+    private fun startedNotify(c: BluetoothGattCharacteristic): Boolean =
+        notifyConfirmed.contains(c.uuid)
+
+    private suspend fun enableNotifications(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic
+    ): Boolean {
+        if (!gatt.setCharacteristicNotification(characteristic, true)) {
+            log("setCharacteristicNotification() returned false for ${characteristic.uuid}")
+            return false
+        }
+        val cccd = characteristic.getDescriptor(BleGattAttributes.CCCD)
+        if (cccd == null) {
+            log("No CCCD on ${characteristic.uuid}")
+            return false
+        }
+
+        val value = if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) {
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        } else {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        }
+
+        repeat(2) { attempt ->
+            val ok = runGattOp(GATT_OP_TIMEOUT_MS) {
+                @Suppress("DEPRECATION")
+                run {
+                    cccd.value = value.copyOf()
+                    gatt.writeDescriptor(cccd)
+                }
+            }
+            if (ok) {
+                notifyConfirmed.add(characteristic.uuid)
+                return true
+            }
+            if (attempt == 0) delay(200)
+        }
+        return false
+    }
+
+    /**
+     * Requires a real read of the battery characteristic. A device that answers this has a live,
+     * bidirectional link; one that does not is reported as unstable rather than "connected".
+     */
+    private suspend fun verifyLink(): Boolean {
+        val gatt = gatt ?: return false
+        val battery = batteryCharacteristic ?: run {
+            log("No battery characteristic available for verification")
+            return false
+        }
+        val ok = runGattOp(HANDSHAKE_TIMEOUT_MS) { gatt.readCharacteristic(battery) }
+        if (!ok) return false
+        return batteryKnown.value
+    }
+
+    /**
+     * Reads device-information characteristics. These are standard GATT reads; each one that
+     * succeeds is displayed, each one that fails stays null and is shown as "not reported".
+     */
+    private fun readDeviceInformation() {
+        scope.launch {
+            val gatt = gatt ?: return@launch
+            val info = gatt.getService(BleGattAttributes.DEVICE_INFO_SERVICE) ?: return@launch
+            val reads = listOf(
+                BleGattAttributes.FIRMWARE_REVISION_CHAR to { v: ByteArray ->
+                    firmwareVersion.value = CrrepaProtocol.decodeFirmware(v)
+                },
+                BleGattAttributes.MODEL_NUMBER_CHAR to { v: ByteArray ->
+                    modelNumber.value = CrrepaProtocol.decodeFirmware(v)
+                },
+                BleGattAttributes.MANUFACTURER_NAME_CHAR to { v: ByteArray ->
+                    manufacturerName.value = CrrepaProtocol.decodeFirmware(v)
+                }
+            )
+            for ((uuid, apply) in reads) {
+                val characteristic = info.getCharacteristic(uuid) ?: continue
+                readTarget = apply
+                val ok = runGattOp(GATT_OP_TIMEOUT_MS) { gatt.readCharacteristic(characteristic) }
+                readTarget = null
+                if (!ok) log("Could not read $uuid")
+                delay(120)
             }
         }
     }
 
-    private fun cleanup() {
-        keepAliveJob?.cancel()
-        try {
-            bluetoothGatt?.close()
-        } catch (e: Exception) {
-            Log.e(tag, "Error closing GATT", e)
+    private var readTarget: ((ByteArray) -> Unit)? = null
+
+    private fun handleReadValue(characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+        log("RX read ${characteristic.uuid} = ${value.toHex()}")
+        when (characteristic.uuid) {
+            BleGattAttributes.BATTERY_LEVEL_CHAR -> {
+                val percent = value.firstOrNull()?.toInt()?.and(0xFF)
+                if (percent != null && percent in 0..100) {
+                    batteryFlow.value = percent
+                    batteryKnown.value = true
+                    lastCommunicationTimestamp.value = System.currentTimeMillis()
+                    log("Battery read: $percent%")
+                } else {
+                    log("Battery read returned an implausible value")
+                }
+            }
+
+            else -> {
+                readTarget?.invoke(value)
+                readTarget = null
+            }
         }
-        bluetoothGatt = null
-        txCharacteristic = null
-        rxCharacteristic = null
     }
+
+    private fun handleLinkLost(reason: String) {
+        log("Link lost: $reason")
+        connectTimeoutJob?.cancel()
+        heartbeatJob?.cancel()
+        resetMeasurementStates("Link lost during measurement")
+        notifyConfirmed.clear()
+        val shouldReconnect = !userDisconnected && targetAddress != null
+        closeGatt()
+        _connectionState.value = if (shouldReconnect) {
+            ConnectionState.Reconnecting(reconnectAttempt + 1, MAX_RECONNECT_ATTEMPTS)
+        } else {
+            ConnectionState.Disconnected
+        }
+        if (shouldReconnect) scheduleReconnect()
+    }
+
+    private fun scheduleReconnect() {
+        val address = targetAddress ?: return
+        if (userDisconnected) return
+        if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+            _connectionState.value = ConnectionState.Failed(
+                "Could not reconnect after $MAX_RECONNECT_ATTEMPTS attempts"
+            )
+            return
+        }
+        reconnectAttempt++
+        val delayMs = minOf(30_000L, 1_000L * (1 shl reconnectAttempt))
+        _connectionState.value = ConnectionState.Reconnecting(reconnectAttempt, MAX_RECONNECT_ATTEMPTS)
+        log("Reconnect attempt $reconnectAttempt in ${delayMs}ms")
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            delay(delayMs)
+            if (!userDisconnected && targetAddress != null) connect(address)
+        }
+    }
+
+    private fun closeGatt() {
+        gattGeneration++
+        runCatching { gatt?.close() }
+        gatt = null
+        writeCharacteristic = null
+        packetCharacteristic = null
+        heartRateCharacteristic = null
+        stepCharacteristic = null
+        batteryCharacteristic = null
+        readTarget = null
+        notifyConfirmed.clear()
+        pendingGattOp?.complete(false)
+        pendingGattOp = null
+        negotiatedMtu.value = 0
+        rxAssembler.reset()
+    }
+
+    // ------------------------------------------------------------------ GATT operation queue
+
+    /**
+     * Runs one GATT request at a time and waits for its callback.
+     * Returns false when the request could not be started, failed, or timed out.
+     */
+    private suspend fun runGattOp(timeoutMs: Long, block: () -> Boolean): Boolean =
+        gattOpMutex.withLock {
+            if (gatt == null) return false
+            val deferred = CompletableDeferred<Boolean>()
+            pendingGattOp = deferred
+            val started = try {
+                block()
+            } catch (e: SecurityException) {
+                log("GATT operation denied: ${e.message}")
+                false
+            } catch (e: Exception) {
+                log("GATT operation threw: ${e.message}")
+                false
+            }
+            if (!started) {
+                pendingGattOp = null
+                return false
+            }
+            val result = withTimeoutOrNull(timeoutMs) { deferred.await() } ?: false
+            pendingGattOp = null
+            result
+        }
+
+    private fun completeGattOp(success: Boolean) {
+        pendingGattOp?.complete(success)
+    }
+
+    // ------------------------------------------------------------------ outbound
+
+    private suspend fun writePacket(packet: ByteArray): Boolean {
+        val gatt = gatt ?: return false
+        val characteristic = writeCharacteristic ?: run {
+            log("No write characteristic resolved")
+            return false
+        }
+
+        val writeType = if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        }
+
+        val ok = runGattOp(GATT_OP_TIMEOUT_MS) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(characteristic, packet, writeType) ==
+                    BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                run {
+                    characteristic.writeType = writeType
+                    characteristic.value = packet
+                    gatt.writeCharacteristic(characteristic)
+                }
+            }
+        }
+        if (ok) log("TX ${packet.toHex()}") else log("TX failed ${packet.toHex()}")
+        return ok
+    }
+
+    // ------------------------------------------------------------------ inbound
+
+    /**
+     * Feeds a notification into the reassembly buffer, then dispatches every complete frame.
+     * Mirrors `com.crrepa.l.a#n0` + `#w0`.
+     */
+    private fun handleNotification(characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+        if (value.isEmpty()) return
+        val uuid = characteristic.uuid
+
+        when (uuid) {
+            BleGattAttributes.HEART_RATE_MEASUREMENT_CHAR -> {
+                CrrepaProtocol.parseHeartRateMeasurement(value)?.let { bpm ->
+                    onHeartRate(bpm)
+                } ?: log("Unparsable heart-rate measurement ${value.toHex()}")
+                return
+            }
+
+            BleGattAttributes.CRP_CHAR_FEE1 -> {
+                CrrepaProtocol.parseSteps(value)?.let(::onSteps)
+                    ?: log("Unparsable step notification ${value.toHex()}")
+                return
+            }
+
+            BleGattAttributes.BATTERY_LEVEL_CHAR -> {
+                val percent = value.firstOrNull()?.toInt()?.and(0xFF) ?: return
+                if (percent in 0..100) {
+                    batteryFlow.value = percent
+                    batteryKnown.value = true
+                    lastCommunicationTimestamp.value = System.currentTimeMillis()
+                }
+                return
+            }
+        }
+
+        // Everything else on the data service is a framed packet.
+        appendAndDrain(value)
+    }
+
+    private fun appendAndDrain(chunk: ByteArray) {
+        val frames = rxAssembler.append(chunk)
+        if (frames.isEmpty()) return
+        lastCommunicationTimestamp.value = System.currentTimeMillis()
+        frames.forEach(::dispatchFrame)
+    }
+
+    private fun dispatchFrame(frame: CrrepaProtocol.Frame) {
+        log("RX op=0x${"%02X".format(frame.opcode)} ${frame.payload.toHex()}")
+
+        when (frame.opcode) {
+            CrrepaProtocol.CMD_BLOOD_OXYGEN -> {
+                CrrepaProtocol.parseBloodOxygen(frame.payload)?.let { spo2 ->
+                    spO2Flow.value = spo2.percentage
+                    completeMeasurement(
+                        spo2Measurement,
+                        MeasurementState.Completed(spo2.percentage)
+                    )
+                    scope.launch { healthRepository.recordBloodOxygen(spo2.percentage) }
+                } ?: log("Ignoring implausible SpO2 payload")
+            }
+
+            CrrepaProtocol.CMD_BLOOD_PRESSURE -> {
+                CrrepaProtocol.parseBloodPressure(frame.payload)?.let { bp ->
+                    if (bp.systolic in 60..260 && bp.diastolic in 30..160 &&
+                        bp.systolic > bp.diastolic
+                    ) {
+                        bloodPressureEverReported.value = true
+                        bloodPressureFlow.value = bp.systolic to bp.diastolic
+                        completeMeasurement(
+                            bloodPressureMeasurement,
+                            MeasurementState.Completed(bp.systolic, bp.diastolic)
+                        )
+                        scope.launch {
+                            healthRepository.recordBloodPressure(bp.systolic, bp.diastolic)
+                        }
+                    } else {
+                        log("Ignoring implausible blood pressure ${bp.systolic}/${bp.diastolic}")
+                    }
+                } ?: log("Blood-pressure payload was not the documented 3-byte form")
+            }
+
+            CrrepaProtocol.CMD_HEART_RATE_ONCE -> {
+                // This reply is a completion state; the BPM itself arrives on 0x2A37.
+                val state = CrrepaProtocol.parseHeartRateState(frame.payload)
+                log("Heart-rate measurement state=${state?.state}")
+                if (state != null && state.state == 0xFF) {
+                    if (heartRateMeasurement.value is MeasurementState.InProgress) {
+                        heartRateMeasurement.value =
+                            MeasurementState.TimedOut("The watch reported no pulse signal")
+                    }
+                }
+            }
+
+            CrrepaProtocol.CMD_QUERY_NEW_ALARMS -> {
+                alarmReplyDeferred?.complete(frame)
+                alarmReplyDeferred = null
+            }
+        }
+    }
+
+    private fun onHeartRate(bpm: Int) {
+        if (bpm !in 25..250) {
+            log("Ignoring implausible heart rate $bpm")
+            return
+        }
+        heartRateFlow.value = bpm
+        lastCommunicationTimestamp.value = System.currentTimeMillis()
+        if (heartRateMeasurement.value is MeasurementState.InProgress ||
+            heartRateMeasurement.value is MeasurementState.Requesting
+        ) {
+            completeMeasurement(heartRateMeasurement, MeasurementState.Completed(bpm))
+        }
+        scope.launch { healthRepository.recordHeartRate(bpm) }
+    }
+
+    private fun onSteps(steps: CrrepaProtocol.Steps) {
+        stepsFlow.value = steps.steps
+        distanceFlow.value = steps.distanceMeters
+        caloriesFlow.value = steps.calories
+        lastCommunicationTimestamp.value = System.currentTimeMillis()
+        if (steps.steps == lastStoredSteps) return
+        lastStoredSteps = steps.steps
+        scope.launch {
+            healthDao.insertStep(
+                StepRecord(
+                    timestamp = System.currentTimeMillis(),
+                    steps = steps.steps,
+                    calories = steps.calories,
+                    distanceMeters = steps.distanceMeters
+                )
+            )
+            healthRepository.requestRefresh()
+        }
+    }
+
+    @Volatile
+    private var lastStoredSteps = -1
+
+    private fun completeMeasurement(
+        target: MutableStateFlow<MeasurementState>,
+        state: MeasurementState
+    ) {
+        measurementTimeoutJob?.cancel()
+        target.value = state
+    }
+
+    private fun resetMeasurementStates(reason: String) {
+        listOf(heartRateMeasurement, spo2Measurement, bloodPressureMeasurement).forEach { flow ->
+            if (flow.value is MeasurementState.InProgress || flow.value is MeasurementState.Requesting) {
+                flow.value = MeasurementState.Failed(reason)
+            }
+        }
+        measurementTimeoutJob?.cancel()
+    }
+
+    // ------------------------------------------------------------------ public commands
+
+    fun syncTime() {
+        scope.launch {
+            if (writePacket(CrrepaProtocol.timeSync())) log("Time sync sent")
+        }
+    }
+
+    fun readBattery() {
+        scope.launch {
+            val gatt = gatt ?: return@launch
+            val characteristic = batteryCharacteristic ?: return@launch
+            runGattOp(GATT_OP_TIMEOUT_MS) { gatt.readCharacteristic(characteristic) }
+        }
+    }
+
+    suspend fun startHeartRateMeasurement() {
+        if (_connectionState.value !is ConnectionState.Ready) {
+            heartRateMeasurement.value = MeasurementState.Failed("Watch is not ready")
+            return
+        }
+        heartRateMeasurement.value = MeasurementState.Requesting
+        if (!writePacket(CrrepaProtocol.heartRateMeasurement(true))) {
+            heartRateMeasurement.value = MeasurementState.Failed("Could not send measurement request")
+            return
+        }
+        heartRateMeasurement.value = MeasurementState.InProgress(System.currentTimeMillis())
+        armMeasurementTimeout(heartRateMeasurement, MEASUREMENT_TIMEOUT_MS)
+    }
+
+    suspend fun stopHeartRateMeasurement() {
+        measurementTimeoutJob?.cancel()
+        heartRateMeasurement.value = MeasurementState.Idle
+        writePacket(CrrepaProtocol.heartRateMeasurement(false))
+    }
+
+    suspend fun startSpO2Measurement() {
+        if (_connectionState.value !is ConnectionState.Ready) {
+            spo2Measurement.value = MeasurementState.Failed("Watch is not ready")
+            return
+        }
+        spo2Measurement.value = MeasurementState.Requesting
+        if (!writePacket(CrrepaProtocol.bloodOxygenMeasurement(true))) {
+            spo2Measurement.value = MeasurementState.Failed("Could not send measurement request")
+            return
+        }
+        spo2Measurement.value = MeasurementState.InProgress(System.currentTimeMillis())
+        armMeasurementTimeout(spo2Measurement, SPO2_TIMEOUT_MS)
+    }
+
+    suspend fun stopSpO2Measurement() {
+        measurementTimeoutJob?.cancel()
+        spo2Measurement.value = MeasurementState.Idle
+        writePacket(CrrepaProtocol.bloodOxygenMeasurement(false))
+    }
+
+    /**
+     * Probes whether this watch reports blood pressure. A reading is shown only if the watch
+     * actually sends opcode 0x69 with a 3-byte payload; otherwise the state becomes
+     * [MeasurementState.NotSupported].
+     */
+    suspend fun probeBloodPressure() {
+        if (_connectionState.value !is ConnectionState.Ready) {
+            bloodPressureMeasurement.value = MeasurementState.Failed("Watch is not ready")
+            return
+        }
+        bloodPressureMeasurement.value = MeasurementState.Requesting
+        if (!writePacket(CrrepaProtocol.bloodPressureMeasurement(true))) {
+            bloodPressureMeasurement.value = MeasurementState.Failed("Could not send request")
+            return
+        }
+        bloodPressureMeasurement.value = MeasurementState.InProgress(System.currentTimeMillis())
+        measurementTimeoutJob?.cancel()
+        measurementTimeoutJob = scope.launch {
+            delay(BP_TIMEOUT_MS)
+            if (bloodPressureMeasurement.value is MeasurementState.InProgress) {
+                bloodPressureMeasurement.value = MeasurementState.NotSupported
+                log("No blood-pressure response within ${BP_TIMEOUT_MS / 1000}s; marking unsupported")
+            }
+        }
+    }
+
+    private fun armMeasurementTimeout(target: MutableStateFlow<MeasurementState>, timeoutMs: Long) {
+        measurementTimeoutJob?.cancel()
+        measurementTimeoutJob = scope.launch {
+            delay(timeoutMs)
+            if (target.value is MeasurementState.InProgress || target.value is MeasurementState.Requesting) {
+                target.value = MeasurementState.TimedOut(
+                    "No reading received within ${timeoutMs / 1000}s"
+                )
+                log("Measurement timed out")
+            }
+        }
+    }
+
+    /**
+     * Triggers the watch's find-me alert.
+     *
+     * The vendor protocol defines **no reply** for `findDevice` (`com.crrepa.g.a#findDevice` is a
+     * single `Q(97, null)` write and `com.crrepa.l.a#w0` has no case for 0x61). The outcome is
+     * therefore reported as [CommandOutcome.AwaitingAcknowledgement] — "sent, unconfirmed" — and
+     * never as acknowledged.
+     */
+    suspend fun findWatch(): CommandOutcome {
+        if (_connectionState.value !is ConnectionState.Ready) {
+            findWatchOutcome.value = CommandOutcome.Failed("Watch is not ready")
+            return findWatchOutcome.value
+        }
+        findWatchOutcome.value = CommandOutcome.Sending
+        val written = writePacket(CrrepaProtocol.findDevice())
+        findWatchOutcome.value = if (written) {
+            CommandOutcome.AwaitingAcknowledgement()
+        } else {
+            CommandOutcome.Failed("Bluetooth write failed")
+        }
+        return findWatchOutcome.value
+    }
+
+    /**
+     * Writes one alarm slot.
+     *
+     * The write itself is verifiable (the GATT write callback confirms the watch received the
+     * bytes). The *alarm being stored* is not: the vendor SDK exposes `queryAllNewAlarm` but the
+     * reference application never reads alarms back to confirm a write. This method therefore
+     * returns [CommandOutcome.AwaitingAcknowledgement]; callers must not mark the row as synced.
+     */
+    suspend fun writeAlarm(alarm: AlarmRecord): CommandOutcome {
+        if (_connectionState.value !is ConnectionState.Ready) {
+            return CommandOutcome.Failed("Watch is not ready").also { alarmSyncOutcome.value = it }
+        }
+        alarmSyncOutcome.value = CommandOutcome.Sending
+        val written = writePacket(
+            CrrepaProtocol.alarm(
+                slot = alarm.id,
+                enabled = alarm.isEnabled,
+                repeatMask = alarm.repeatDays,
+                hour = alarm.hour,
+                minute = alarm.minute
+            )
+        )
+        val outcome = if (written) {
+            CommandOutcome.AwaitingAcknowledgement()
+        } else {
+            CommandOutcome.Failed("Bluetooth write failed")
+        }
+        alarmSyncOutcome.value = outcome
+        return outcome
+    }
+
+    // ------------------------------------------------------------------ heartbeat
+
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            while (isActive) {
+                delay(HEARTBEAT_INTERVAL_MS)
+                if (_connectionState.value !is ConnectionState.Ready) return@launch
+                readBattery()
+                delay(2_000)
+                val silentFor = System.currentTimeMillis() - lastCommunicationTimestamp.value
+                if (silentFor > 75_000) {
+                    log("No traffic from watch for ${silentFor}ms")
+                    _connectionState.value = ConnectionState.Unstable(
+                        "No traffic from the watch for over a minute",
+                        lastVerifiedAt = lastCommunicationTimestamp.value.takeIf { it > 0 },
+                        connected = true
+                    )
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ diagnostics
+
+    private fun log(message: String) {
+        Log.d(TAG, message)
+        val entry = "${timestampNow()}  $message"
+        _diagnostics.value = (_diagnostics.value + entry).takeLast(DIAGNOSTIC_LIMIT)
+    }
+
+    fun clearDiagnostics() {
+        _diagnostics.value = emptyList()
+    }
+
+    private fun timestampNow(): String =
+        java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+            .format(java.util.Date())
+
+    private fun ByteArray.toHex(): String =
+        if (isEmpty()) "(empty)" else joinToString(" ") { "%02X".format(it) }
 }

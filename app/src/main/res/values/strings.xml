@@ -1,6 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Marv Neo Companion</string>
-    <string name="channel_name">Watch Connection Service</string>
-    <string name="channel_desc">Maintains persistent BLE connection with Marv Neo watch</string>
+    <string name="app_name">Marv Neo</string>
+    <string name="notification_channel_name">Watch connection</string>
+    <string name="notification_channel_description">Shows the live Bluetooth link state with your watch.</string>
 </resources>
-

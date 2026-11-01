@@ -15,16 +15,19 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface HealthDao {
 
-    // Steps
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertStep(record: StepRecord)
+    // ---- Steps ----
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertStep(record: StepRecord): Long
 
     @Query("SELECT * FROM steps_record ORDER BY timestamp DESC LIMIT 1")
     fun getLatestSteps(): Flow<StepRecord?>
 
-    // Heart Rate
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertHeartRate(record: HeartRateRecord)
+    @Query("SELECT * FROM steps_record WHERE timestamp BETWEEN :start AND :end ORDER BY timestamp ASC")
+    fun getStepsBetween(start: Long, end: Long): Flow<List<StepRecord>>
+
+    // ---- Heart rate ----
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertHeartRate(record: HeartRateRecord): Long
 
     @Query("SELECT * FROM heart_rate_record ORDER BY timestamp DESC LIMIT 100")
     fun getRecentHeartRates(): Flow<List<HeartRateRecord>>
@@ -32,21 +35,12 @@ interface HealthDao {
     @Query("SELECT * FROM heart_rate_record WHERE timestamp BETWEEN :start AND :end ORDER BY timestamp ASC")
     fun getHeartRatesBetween(start: Long, end: Long): Flow<List<HeartRateRecord>>
 
-    @Query("SELECT AVG(bpm) FROM heart_rate_record WHERE timestamp >= :since AND bpm > 0")
-    fun getAvgHeartRateSince(since: Long): Flow<Double?>
+    @Query("SELECT COUNT(*) FROM heart_rate_record WHERE bpm = :bpm AND timestamp BETWEEN :from AND :to")
+    suspend fun countHeartRateInWindow(bpm: Int, from: Long, to: Long): Int
 
-    @Query("SELECT MIN(bpm) FROM heart_rate_record WHERE timestamp >= :since AND bpm > 0")
-    fun getMinHeartRateSince(since: Long): Flow<Int?>
-
-    @Query("SELECT MAX(bpm) FROM heart_rate_record WHERE timestamp >= :since AND bpm > 0")
-    fun getMaxHeartRateSince(since: Long): Flow<Int?>
-
-    @Query("SELECT COUNT(*) FROM heart_rate_record WHERE timestamp >= :since AND bpm > 0")
-    fun getHeartRateCountSince(since: Long): Flow<Int>
-
-    // Blood Oxygen (SpO2)
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertBloodOxygen(record: BloodOxygenRecord)
+    // ---- SpO2 ----
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertBloodOxygen(record: BloodOxygenRecord): Long
 
     @Query("SELECT * FROM blood_oxygen_record ORDER BY timestamp DESC LIMIT 100")
     fun getRecentBloodOxygen(): Flow<List<BloodOxygenRecord>>
@@ -54,21 +48,12 @@ interface HealthDao {
     @Query("SELECT * FROM blood_oxygen_record WHERE timestamp BETWEEN :start AND :end ORDER BY timestamp ASC")
     fun getBloodOxygenBetween(start: Long, end: Long): Flow<List<BloodOxygenRecord>>
 
-    @Query("SELECT AVG(percentage) FROM blood_oxygen_record WHERE timestamp >= :since AND percentage > 0")
-    fun getAvgBloodOxygenSince(since: Long): Flow<Double?>
+    @Query("SELECT COUNT(*) FROM blood_oxygen_record WHERE percentage = :percentage AND timestamp BETWEEN :from AND :to")
+    suspend fun countBloodOxygenInWindow(percentage: Int, from: Long, to: Long): Int
 
-    @Query("SELECT MIN(percentage) FROM blood_oxygen_record WHERE timestamp >= :since AND percentage > 0")
-    fun getMinBloodOxygenSince(since: Long): Flow<Int?>
-
-    @Query("SELECT MAX(percentage) FROM blood_oxygen_record WHERE timestamp >= :since AND percentage > 0")
-    fun getMaxBloodOxygenSince(since: Long): Flow<Int?>
-
-    @Query("SELECT COUNT(*) FROM blood_oxygen_record WHERE timestamp >= :since AND percentage > 0")
-    fun getBloodOxygenCountSince(since: Long): Flow<Int>
-
-    // Blood Pressure
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertBloodPressure(record: BloodPressureRecord)
+    // ---- Blood pressure ----
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertBloodPressure(record: BloodPressureRecord): Long
 
     @Query("SELECT * FROM blood_pressure_record ORDER BY timestamp DESC LIMIT 100")
     fun getRecentBloodPressure(): Flow<List<BloodPressureRecord>>
@@ -76,28 +61,25 @@ interface HealthDao {
     @Query("SELECT * FROM blood_pressure_record WHERE timestamp BETWEEN :start AND :end ORDER BY timestamp ASC")
     fun getBloodPressureBetween(start: Long, end: Long): Flow<List<BloodPressureRecord>>
 
-    @Query("SELECT AVG(systolic) FROM blood_pressure_record WHERE timestamp >= :since AND systolic > 0")
-    fun getAvgSystolicSince(since: Long): Flow<Double?>
+    // ---- Sleep ----
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertSleep(record: SleepRecord): Long
 
-    @Query("SELECT AVG(diastolic) FROM blood_pressure_record WHERE timestamp >= :since AND diastolic > 0")
-    fun getAvgDiastolicSince(since: Long): Flow<Double?>
+    @Query("SELECT * FROM sleep_record WHERE endTime BETWEEN :start AND :end ORDER BY endTime ASC")
+    fun getSleepBetween(start: Long, end: Long): Flow<List<SleepRecord>>
 
-    @Query("SELECT COUNT(*) FROM blood_pressure_record WHERE timestamp >= :since AND systolic > 0")
-    fun getBloodPressureCountSince(since: Long): Flow<Int>
-
-    // Sleep
+    // ---- Alarms ----
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertSleep(record: SleepRecord)
-
-    @Query("SELECT * FROM sleep_record ORDER BY endTime DESC LIMIT 7")
-    fun getWeeklySleep(): Flow<List<SleepRecord>>
-
-    // Alarms
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertAlarm(alarm: AlarmRecord)
+    suspend fun upsertAlarm(alarm: AlarmRecord)
 
     @Query("SELECT * FROM alarm_record ORDER BY id ASC")
     fun getAllAlarms(): Flow<List<AlarmRecord>>
+
+    @Query("SELECT * FROM alarm_record WHERE id = :id")
+    suspend fun getAlarm(id: Int): AlarmRecord?
+
+    @Query("UPDATE alarm_record SET syncState = :syncState, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun updateAlarmSyncState(id: Int, syncState: String, updatedAt: Long)
 
     @Query("DELETE FROM alarm_record WHERE id = :id")
     suspend fun deleteAlarm(id: Int)

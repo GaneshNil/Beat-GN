@@ -3,258 +3,324 @@ package com.marvneo.companion.data.ble.protocol
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Calendar
+import java.util.Locale
+import java.util.TimeZone
 
+/**
+ * Packet codec for Crrepa-class smartwatch firmware (the family the beatXP Marv Neo reference
+ * application talks to).
+ *
+ * Every constant below is traceable to bytecode in the reference APK. See PROTOCOL_EVIDENCE.md
+ * for the exact class and method for each one — nothing here is guessed.
+ *
+ * ## Wire frame
+ * Built by `Lio/grpc/w;->Q(I[B)[B`:
+ * ```
+ * [0]=0xFE  [1]=0xEA  [2]=version  [3]=totalLength  [4]=command  [5..]=payload
+ * ```
+ * `version` is `0x10` when the negotiated chunk size is the default 20 bytes, otherwise `0x20`.
+ * `totalLength` counts the whole packet including the 5 header bytes.
+ *
+ * Inbound reassembly (`com.crrepa.l.a#n0`) checks `bArr[0] == 0xFE && bArr[1] == 0xEA`, reads the
+ * version from byte 2 and the total length from byte 3.
+ *
+ * This file is pure JVM byte handling so it can be unit tested without a device.
+ */
 object CrrepaProtocol {
 
-    // Crrepa Packet Header Constants
-    const val MAGIC_BYTE_0: Byte = 0xFE.toByte()
-    const val MAGIC_BYTE_1: Byte = 0xEA.toByte()
-    const val PROTOCOL_VERSION_1: Byte = 0x10
-    const val PROTOCOL_VERSION_2: Byte = 0x20
+    const val MAGIC_0 = 0xFE
+    const val MAGIC_1 = 0xEA
 
-    // Authentic Crrepa Hardware Command Opcodes (Extracted from beatXP.apk)
-    const val CMD_SYNC_TIME: Byte = 0x01
-    const val CMD_QUERY_BATTERY: Byte = 0x03
-    const val CMD_RAISE_TO_WAKE: Byte = 0x05
-    const val CMD_FIND_WATCH: Byte = 0x61         // Real Crrepa findDevice opcode (97)
-    const val CMD_HEART_RATE_ONCE: Byte = 0x6D    // Realtime/once heart rate measurement (109)
-    const val CMD_BLOOD_OXYGEN: Byte = 0x6B       // Blood oxygen SpO2 measurement (107)
-    const val CMD_BLOOD_PRESSURE: Byte = 0x69     // Blood pressure measurement (105)
-    const val CMD_CAMERA_CONTROL: Byte = 0x09
-    const val CMD_TIME_FORMAT: Byte = 0x0A
-    const val CMD_ALARM: Byte = 0x11
-    const val CMD_QUERY_STEPS: Byte = 0x12
-    const val CMD_NOTIFICATION: Byte = 0x23
+    /** Protocol version used when the chunk size is the default 20 bytes. */
+    const val VERSION_1 = 0x10
+    /** Protocol version used once a larger MTU is negotiated. */
+    const val VERSION_2 = 0x20
 
-    // Notification Type IDs (from CRPBleMessageType)
-    const val NOTIF_CALL: Byte = 0x01
-    const val NOTIF_SMS: Byte = 0x02
-    const val NOTIF_WECHAT: Byte = 0x03
-    const val NOTIF_FACEBOOK: Byte = 0x04
-    const val NOTIF_TWITTER: Byte = 0x05
-    const val NOTIF_WHATSAPP: Byte = 0x06
-    const val NOTIF_INSTAGRAM: Byte = 0x07
-    const val NOTIF_SKYPE: Byte = 0x08
-    const val NOTIF_TELEGRAM: Byte = 0x09
-    const val NOTIF_LINKEDIN: Byte = 0x0A
-    const val NOTIF_GMAIL: Byte = 0x0B
-    const val NOTIF_YOUTUBE: Byte = 0x0C
-    const val NOTIF_OTHER: Byte = 0xFF.toByte()
+    const val HEADER_SIZE = 5
+
+    // ---------------------------------------------------------------- outbound commands
+    // Values are the first argument passed to `io.grpc.w.Q(...)` in `com.crrepa.g.a`.
+
+    /** `com.crrepa.g.a#syncTime` -> `Q(49, {unixSecondsLe32, timezoneHours})`. */
+    const val CMD_TIME_SYNC = 0x31
+
+    /** `com.crrepa.g.a#findDevice` -> `Q(97, null)`. No reply frame is defined for it. */
+    const val CMD_FIND_DEVICE = 0x61
 
     /**
-     * Encloses an opcode and its payload in the authentic Crrepa packet frame:
-     * [0xFE, 0xEA, 0x10, TotalLength, Opcode, PayloadBytes...]
+     * `com.crrepa.g.a#startMeasureOnceHeartRate` -> `Q(109, {0x00})` and
+     * `#stopMeasureOnceHeartRate` -> `Q(109, {0xFF})`.
+     *
+     * The reply (`com.crrepa.l.a#K0`) carries a *completion state*, not a BPM. Actual beats per
+     * minute arrive on the standard Heart Rate Measurement characteristic (0x2A37).
      */
-    fun framePacket(opcode: Byte, payload: ByteArray = byteArrayOf()): ByteArray {
-        val totalLength = (5 + payload.size).toByte()
-        val packet = ByteArray(5 + payload.size)
-        packet[0] = MAGIC_BYTE_0
-        packet[1] = MAGIC_BYTE_1
-        packet[2] = PROTOCOL_VERSION_1
-        packet[3] = totalLength
-        packet[4] = opcode
-        if (payload.isNotEmpty()) {
-            System.arraycopy(payload, 0, packet, 5, payload.size)
+    const val CMD_HEART_RATE_ONCE = 0x6D
+
+    /** `#startMeasureBloodOxygen` -> `Q(107, {0x00})`; `#stopMeasureBloodOxygen` -> `Q(107, {0xFF})`. */
+    const val CMD_BLOOD_OXYGEN = 0x6B
+
+    /** `#startMeasureBloodPressure` -> `Q(105, {0,0,0})`; stop -> `Q(105, {0xFF,0xFF,0xFF})`. */
+    const val CMD_BLOOD_PRESSURE = 0x69
+
+    /** `#sendAlarm` -> `Q(17, <8-byte alarm payload>)`. */
+    const val CMD_ALARM = 0x11
+
+    /** `#queryAllNewAlarm` -> `Q(-71, {0x15, 0x04})`. */
+    const val CMD_QUERY_NEW_ALARMS = 0xB9
+
+    // ---------------------------------------------------------------- frame assembly
+
+    data class Frame(val version: Int, val opcode: Int, val payload: ByteArray) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is Frame) return false
+            return version == other.version &&
+                opcode == other.opcode &&
+                payload.contentEquals(other.payload)
         }
-        return packet
+
+        override fun hashCode(): Int =
+            (version * 31 + opcode) * 31 + payload.contentHashCode()
     }
 
     /**
-     * Builds a Time Synchronization packet.
-     * Format: [0xFE, 0xEA, 0x10, 0x0C, 0x01, YearLow, YearHigh, Month, Day, Hour, Minute, Second]
+     * Wraps [opcode] and [payload] in the vendor frame.
+     *
+     * @param version 0x10 for the default 20-byte chunk size, 0x20 after a larger MTU.
      */
-    fun createTimeSyncPacket(calendar: Calendar = Calendar.getInstance()): ByteArray {
-        val year = calendar.get(Calendar.YEAR)
-        val month = (calendar.get(Calendar.MONTH) + 1).toByte()
-        val day = calendar.get(Calendar.DAY_OF_MONTH).toByte()
-        val hour = calendar.get(Calendar.HOUR_OF_DAY).toByte()
-        val min = calendar.get(Calendar.MINUTE).toByte()
-        val sec = calendar.get(Calendar.SECOND).toByte()
-
-        val payload = byteArrayOf(
-            (year and 0xFF).toByte(),
-            ((year shr 8) and 0xFF).toByte(),
-            month,
-            day,
-            hour,
-            min,
-            sec
-        )
-        return framePacket(CMD_SYNC_TIME, payload)
-    }
-
-    /**
-     * Builds a Battery Level query packet.
-     */
-    fun createBatteryQueryPacket(): ByteArray = framePacket(CMD_QUERY_BATTERY)
-
-    /**
-     * Builds a Step query packet.
-     */
-    fun createStepsQueryPacket(): ByteArray = framePacket(CMD_QUERY_STEPS, byteArrayOf(0x01, 0x00))
-
-    /**
-     * Builds a Find Watch vibration/screen alert packet using authentic opcode 0x61.
-     * @param enable true to start ringing/vibrating, false to cancel.
-     */
-    fun createFindWatchPacket(enable: Boolean): ByteArray =
-        framePacket(CMD_FIND_WATCH, byteArrayOf(if (enable) 0x01 else 0x00))
-
-    /**
-     * Builds a Heart Rate measure trigger packet using authentic Crrepa opcode 0x6D.
-     * @param enable true to start measurement, false to stop.
-     */
-    fun createHeartRateControlPacket(enable: Boolean): ByteArray =
-        framePacket(CMD_HEART_RATE_ONCE, byteArrayOf(if (enable) 0x01 else 0x00))
-
-    /**
-     * Builds an SpO2 (Blood Oxygen) measure trigger packet using authentic Crrepa opcode 0x6B.
-     * @param enable true to start measurement, false to stop.
-     */
-    fun createSpO2ControlPacket(enable: Boolean): ByteArray =
-        framePacket(CMD_BLOOD_OXYGEN, byteArrayOf(if (enable) 0x01 else 0x00))
-
-    /**
-     * Builds a Blood Pressure measure trigger packet using authentic Crrepa opcode 0x69.
-     * @param enable true to start measurement, false to stop.
-     */
-    fun createBloodPressureControlPacket(enable: Boolean): ByteArray =
-        framePacket(CMD_BLOOD_PRESSURE, byteArrayOf(if (enable) 0x01 else 0x00))
-
-    /**
-     * Builds an Alarm synchronization packet using authentic Crrepa opcode 0x11.
-     * Format: [0xFE, 0xEA, 0x10, 0x0A, 0x11, Id, IsEnable, RepeatMode, Hour, Minute]
-     * @param id Alarm slot index (0..2)
-     * @param isEnabled Whether alarm is active
-     * @param repeatDaysMask Bitmask of repeating days (bit 0=Mon, 1=Tue, ..., 6=Sun; 0x7F = every day)
-     */
-    fun createAlarmPacket(
-        id: Int,
-        isEnabled: Boolean,
-        repeatDaysMask: Int,
-        hour: Int,
-        minute: Int
+    fun frame(
+        opcode: Int,
+        payload: ByteArray = ByteArray(0),
+        version: Int = VERSION_1
     ): ByteArray {
-        val payload = byteArrayOf(
-            (id and 0xFF).toByte(),
-            if (isEnabled) 0x01 else 0x00,
-            (repeatDaysMask and 0xFF).toByte(),
-            (hour and 0xFF).toByte(),
-            (minute and 0xFF).toByte()
+        val total = payload.size + HEADER_SIZE
+        require(total <= 0xFF) { "Crrepa packet too large: $total bytes" }
+        val out = ByteArray(total)
+        out[0] = MAGIC_0.toByte()
+        out[1] = MAGIC_1.toByte()
+        out[2] = version.toByte()
+        out[3] = total.toByte()
+        out[4] = opcode.toByte()
+        payload.copyInto(out, HEADER_SIZE)
+        return out
+    }
+
+    /**
+     * Strict parser: returns null unless the buffer is a complete, well-formed frame.
+     * A strict parser is what keeps the UI honest — junk is never interpreted as data.
+     */
+    fun parse(raw: ByteArray): Frame? {
+        if (raw.size < HEADER_SIZE) return null
+        if ((raw[0].toInt() and 0xFF) != MAGIC_0) return null
+        if ((raw[1].toInt() and 0xFF) != MAGIC_1) return null
+        val declaredLength = raw[3].toInt() and 0xFF
+        if (declaredLength < HEADER_SIZE || declaredLength > raw.size) return null
+        return Frame(
+            version = raw[2].toInt() and 0xFF,
+            opcode = raw[4].toInt() and 0xFF,
+            payload = raw.copyOfRange(HEADER_SIZE, declaredLength)
         )
-        return framePacket(CMD_ALARM, payload)
     }
 
-    /**
-     * Query existing alarms configured on the watch.
-     */
-    fun createAlarmQueryPacket(): ByteArray = framePacket(CMD_ALARM, byteArrayOf(0x00))
+    // ---------------------------------------------------------------- command builders
 
     /**
-     * Builds Camera shutter mode packet.
+     * Time synchronisation. Payload is a 4-byte little-endian Unix timestamp in seconds followed
+     * by the device's UTC offset in whole hours, which is what the vendor SDK sends.
      */
-    fun createCameraModePacket(open: Boolean): ByteArray =
-        framePacket(CMD_CAMERA_CONTROL, byteArrayOf(if (open) 0x01 else 0x00))
+    fun timeSync(nowMillis: Long = System.currentTimeMillis(), zone: TimeZone = TimeZone.getDefault()): ByteArray {
+        val seconds = nowMillis / 1000
+        val offsetHours = zone.getOffset(nowMillis) / 3_600_000
+        val payload = ByteArray(5)
+        payload[0] = (seconds and 0xFF).toByte()
+        payload[1] = ((seconds shr 8) and 0xFF).toByte()
+        payload[2] = ((seconds shr 16) and 0xFF).toByte()
+        payload[3] = ((seconds shr 24) and 0xFF).toByte()
+        payload[4] = offsetHours.toByte()
+        return frame(CMD_TIME_SYNC, payload)
+    }
+
+    /** Starts/stops the watch's find-me alert. The vendor protocol defines no reply. */
+    fun findDevice(): ByteArray = frame(CMD_FIND_DEVICE)
+
+    fun heartRateMeasurement(start: Boolean): ByteArray =
+        frame(CMD_HEART_RATE_ONCE, byteArrayOf(if (start) 0x00 else 0xFF.toByte()))
+
+    fun bloodOxygenMeasurement(start: Boolean): ByteArray =
+        frame(CMD_BLOOD_OXYGEN, byteArrayOf(if (start) 0x00 else 0xFF.toByte()))
+
+    fun bloodPressureMeasurement(start: Boolean): ByteArray =
+        frame(
+            CMD_BLOOD_PRESSURE,
+            if (start) byteArrayOf(0x00, 0x00, 0x00) else byteArrayOf(-1, -1, -1)
+        )
 
     /**
-     * Builds Raise-To-Wake wrist turn packet.
+     * Alarm slot write.
+     *
+     * Payload layout, verified from `Lio/grpc/w;->S(CRPAlarmInfo)[B`:
+     * ```
+     * [0] slot id
+     * [1] enabled (0/1)
+     * [2] mode: 0 = single occurrence, 0x7F = every day, 2 = custom repeat
+     * [3] hour
+     * [4] minute
+     * [5..6] date code, little endian, only used for single-occurrence alarms
+     * [7] repeat bitmask
+     * ```
+     *
+     * Repeat mask bits follow `CRPAlarmInfo`: bit0 = Sunday, bit1 = Monday, ... bit6 = Saturday,
+     * with 0x7F meaning every day.
      */
-    fun createRaiseToWakePacket(enabled: Boolean, startHour: Int = 8, endHour: Int = 22): ByteArray {
-        val payload = if (enabled) {
-            byteArrayOf(0x01, startHour.toByte(), 0x00, endHour.toByte(), 0x00)
+    fun alarm(
+        slot: Int,
+        enabled: Boolean,
+        repeatMask: Int,
+        hour: Int,
+        minute: Int,
+        oneOffDateMillis: Long? = null
+    ): ByteArray {
+        val payload = ByteArray(8)
+        payload[0] = slot.toByte()
+        payload[1] = if (enabled) 1 else 0
+        payload[2] = when {
+            oneOffDateMillis != null -> 0x00
+            repeatMask == REPEAT_EVERY_DAY -> 0x7F
+            else -> 0x02
+        }
+        payload[3] = hour.toByte()
+        payload[4] = minute.toByte()
+
+        val dateCode = if (oneOffDateMillis != null) {
+            val cal = Calendar.getInstance().apply { timeInMillis = oneOffDateMillis }
+            // year - 2015, month (1-12), day-of-month packed as the vendor SDK does.
+            ((cal.get(Calendar.YEAR) - 2015) shl 12) or
+                ((cal.get(Calendar.MONTH) + 1) shl 8) or
+                cal.get(Calendar.DAY_OF_MONTH)
         } else {
-            byteArrayOf(0x00)
+            0
         }
-        return framePacket(CMD_RAISE_TO_WAKE, payload)
+        payload[5] = (dateCode and 0xFF).toByte()
+        payload[6] = ((dateCode shr 8) and 0xFF).toByte()
+        payload[7] = repeatMask.toByte()
+        return frame(CMD_ALARM, payload)
+    }
+
+    /** Asks the watch to report every alarm slot it currently holds. */
+    fun queryNewAlarms(): ByteArray =
+        frame(CMD_QUERY_NEW_ALARMS, byteArrayOf(0x15, 0x04))
+
+    /** Repeat-mask bits, deliberately named so call sites cannot get Sunday/Monday wrong. */
+    const val REPEAT_SUNDAY = 0x01
+    const val REPEAT_MONDAY = 0x02
+    const val REPEAT_TUESDAY = 0x04
+    const val REPEAT_WEDNESDAY = 0x08
+    const val REPEAT_THURSDAY = 0x10
+    const val REPEAT_FRIDAY = 0x20
+    const val REPEAT_SATURDAY = 0x40
+    const val REPEAT_EVERY_DAY = 0x7F
+
+    // ---------------------------------------------------------------- inbound parsing
+
+    data class HeartRateState(val state: Int)
+    data class SpO2(val percentage: Int)
+    data class BloodPressure(val systolic: Int, val diastolic: Int)
+    data class Steps(val steps: Int, val distanceMeters: Int, val calories: Int, val activeMinutes: Int?)
+
+    /** `com.crrepa.l.a#K0`: one byte of measurement state for the 0x6D reply. */
+    fun parseHeartRateState(payload: ByteArray): HeartRateState? {
+        if (payload.isEmpty()) return null
+        return HeartRateState(payload[0].toInt() and 0xFF)
+    }
+
+    /** `com.crrepa.l.a#N0`: `onBloodOxygen(payload[0])`. */
+    fun parseBloodOxygen(payload: ByteArray): SpO2? {
+        if (payload.isEmpty()) return null
+        val percent = payload[0].toInt() and 0xFF
+        if (percent !in 50..100) return null
+        return SpO2(percent)
     }
 
     /**
-     * Builds 12h/24h Time format packet.
-     * @param is24Hour true for 24-hour format, false for 12-hour format.
+     * `com.crrepa.i.b#a`: requires exactly three bytes and reads
+     * `systolic = payload[1]`, `diastolic = payload[2]`.
      */
-    fun createTimeFormatPacket(is24Hour: Boolean): ByteArray =
-        framePacket(CMD_TIME_FORMAT, byteArrayOf(if (is24Hour) 0x00 else 0x01))
-
-    /**
-     * Formats an incoming notification push packet.
-     * Format: [0x23, AppType, TitleLen, TitleBytes..., MsgLen, MsgBytes...]
-     */
-    fun createNotificationPacket(type: Byte, title: String, message: String): ByteArray {
-        val titleBytes = title.take(32).toByteArray(Charsets.UTF_8)
-        val msgBytes = message.take(128).toByteArray(Charsets.UTF_8)
-
-        val buffer = ByteBuffer.allocate(3 + titleBytes.size + 1 + msgBytes.size)
-        buffer.put(CMD_NOTIFICATION)
-        buffer.put(type)
-        buffer.put(titleBytes.size.toByte())
-        buffer.put(titleBytes)
-        buffer.put(msgBytes.size.toByte())
-        buffer.put(msgBytes)
-
-        return buffer.array()
-    }
-
-    // Telemetry Data Types
-    data class StepsData(val steps: Int, val calories: Int, val distanceMeters: Int)
-    data class BatteryData(val percentage: Int, val isCharging: Boolean)
-    data class HeartRateData(val bpm: Int, val status: Int)
-    data class SpO2Data(val percentage: Int, val status: Int)
-    data class BloodPressureData(val systolic: Int, val diastolic: Int, val status: Int)
-
-    fun parseSteps(payload: ByteArray): StepsData? {
-        // Strip Crrepa framing if present [FE, EA, 10, len, 0x12/0x11, ...]
-        val data = unframeIfNeeded(payload)
-        if (data.size < 12) return null
-        val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
-        val steps = buffer.getInt(0)
-        val calories = buffer.getInt(4)
-        val distance = buffer.getInt(8)
-        return StepsData(steps, calories, distance)
-    }
-
-    fun parseBattery(payload: ByteArray): BatteryData? {
-        val data = unframeIfNeeded(payload)
-        if (data.isEmpty()) return null
-        val percentage = data[0].toInt() and 0xFF
-        val isCharging = if (data.size > 1) data[1].toInt() == 1 else false
-        return BatteryData(percentage.coerceIn(0, 100), isCharging)
-    }
-
-    fun parseHeartRate(payload: ByteArray): HeartRateData? {
-        val data = unframeIfNeeded(payload)
-        if (data.isEmpty()) return null
-        val bpm = data[0].toInt() and 0xFF
-        val status = if (data.size > 1) data[1].toInt() and 0xFF else 0
-        return HeartRateData(bpm, status)
-    }
-
-    fun parseSpO2(payload: ByteArray): SpO2Data? {
-        val data = unframeIfNeeded(payload)
-        if (data.isEmpty()) return null
-        val percentage = data[0].toInt() and 0xFF
-        val status = if (data.size > 1) data[1].toInt() and 0xFF else 0
-        return SpO2Data(percentage.coerceIn(0, 100), status)
-    }
-
-    fun parseBloodPressure(payload: ByteArray): BloodPressureData? {
-        val data = unframeIfNeeded(payload)
-        if (data.size < 2) return null
-        val systolic = data[0].toInt() and 0xFF
-        val diastolic = data[1].toInt() and 0xFF
-        val status = if (data.size > 2) data[2].toInt() and 0xFF else 0
-        return BloodPressureData(systolic, diastolic, status)
+    fun parseBloodPressure(payload: ByteArray): BloodPressure? {
+        if (payload.size != 3) return null
+        val systolic = payload[1].toInt() and 0xFF
+        val diastolic = payload[2].toInt() and 0xFF
+        if (systolic == 0 || diastolic == 0) return null
+        return BloodPressure(systolic, diastolic)
     }
 
     /**
-     * Unwraps packet if enclosed with Crrepa [0xFE, 0xEA, version, len, opcode, payload...]
+     * Standard Heart Rate Measurement characteristic (0x2A37).
+     * Byte 0 holds flags; bit0 clear means the BPM is a single byte at index 1.
      */
-    fun unframeIfNeeded(packet: ByteArray): ByteArray {
-        if (packet.size >= 5 && packet[0] == MAGIC_BYTE_0 && packet[1] == MAGIC_BYTE_1) {
-            val payloadLen = packet.size - 5
-            val out = ByteArray(payloadLen)
-            System.arraycopy(packet, 5, out, 0, payloadLen)
-            return out
+    fun parseHeartRateMeasurement(value: ByteArray): Int? {
+        if (value.size < 2) return null
+        val flags = value[0].toInt() and 0xFF
+        val bpm = if (flags and 0x01 == 0) {
+            value[1].toInt() and 0xFF
+        } else {
+            if (value.size < 3) return null
+            // 16-bit little-endian
+            ((value[1].toInt() and 0xFF) or ((value[2].toInt() and 0xFF) shl 8))
         }
-        return packet
+        return bpm.takeIf { it in 1..65535 }
+    }
+
+    /**
+     * Live step notification on FEE1 (`Lcom/google/android/play/core/appupdate/d;->D([B)`).
+     * The payload is a sequence of 3-byte little-endian values: steps, distance, calories and
+     * optionally active minutes.
+     */
+    fun parseSteps(value: ByteArray): Steps? {
+        if (value.isEmpty() || value.size % 3 != 0 || value.size < 9) return null
+        val steps = readUInt24Le(value, 0)
+        val distance = readUInt24Le(value, 3)
+        val calories = readUInt24Le(value, 6)
+        val activeMinutes = if (value.size >= 12) readUInt24Le(value, 9) else null
+        return Steps(steps = steps, distanceMeters = distance, calories = calories, activeMinutes = activeMinutes)
+    }
+
+    private fun readUInt24Le(bytes: ByteArray, offset: Int): Int {
+        if (offset + 3 > bytes.size) return 0
+        return (bytes[offset].toInt() and 0xFF) or
+            ((bytes[offset + 1].toInt() and 0xFF) shl 8) or
+            ((bytes[offset + 2].toInt() and 0xFF) shl 16)
+    }
+
+    /** Firmware string is read from the standard 0x2A28 characteristic, not from a packet. */
+    fun decodeFirmware(raw: ByteArray): String =
+        String(raw, Charsets.UTF_8).trim { it <= ' ' || it == '\u0000' }
+
+    fun formatAlarmLabel(hour: Int, minute: Int): String =
+        String.format(Locale.getDefault(), "%02d:%02d", hour, minute)
+
+    /** Converts a `java.util.Calendar` day-of-week constant into the vendor repeat-mask bit. */
+    fun maskBitForCalendarDay(calendarDayOfWeek: Int): Int = when (calendarDayOfWeek) {
+        Calendar.SUNDAY -> REPEAT_SUNDAY
+        Calendar.MONDAY -> REPEAT_MONDAY
+        Calendar.TUESDAY -> REPEAT_TUESDAY
+        Calendar.WEDNESDAY -> REPEAT_WEDNESDAY
+        Calendar.THURSDAY -> REPEAT_THURSDAY
+        Calendar.FRIDAY -> REPEAT_FRIDAY
+        else -> REPEAT_SATURDAY
+    }
+
+    fun repeatsOn(mask: Int, calendarDayOfWeek: Int): Boolean =
+        (mask and maskBitForCalendarDay(calendarDayOfWeek)) != 0
+
+    /** Little-endian 2-byte helper, matching `com.crrepa.n0.a#o`. */
+    fun readShortLe(bytes: ByteArray, offset: Int): Int {
+        if (offset + 1 >= bytes.size) return 0
+        return (bytes[offset].toInt() and 0xFF) or ((bytes[offset + 1].toInt() and 0xFF) shl 8)
+    }
+
+    /** Little-endian 4-byte helper, matching `com.crrepa.n0.a#v`. */
+    fun readIntLe(bytes: ByteArray, offset: Int): Long {
+        if (offset + 3 >= bytes.size) return 0
+        return ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
     }
 }

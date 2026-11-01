@@ -12,10 +12,12 @@ interface VoiceDao {
     @Query("SELECT * FROM voice_messages ORDER BY timestamp ASC")
     fun getAllMessages(): Flow<List<VoiceMessageRecord>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertMessage(record: VoiceMessageRecord): Long
 
     @Query("DELETE FROM voice_messages")
     suspend fun clearHistory()
-}
 
+    @Query("SELECT COUNT(*) FROM voice_messages")
+    fun countMessages(): Flow<Int>
+}

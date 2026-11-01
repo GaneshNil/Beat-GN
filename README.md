@@ -1,33 +1,69 @@
-# Marv Neo Companion App
+# Marv Neo Companion
 
-A modern, privacy-focused, zero-telemetry companion application for the **beatXP Marv Neo** smartwatch (and compatible Crrepa/DaFit hardware devices), engineered with **Kotlin**, **Jetpack Compose**, and **Material 3**.
+A local-first Android companion for the **beatXP Marv Neo** (Crrepa/DaFit-class firmware), built with
+Kotlin, Jetpack Compose and Room.
 
----
-
-## Key Highlights
-
-* **Android 11 through Android 16 Ready**:
-  * `minSdk = 30` (Android 11) for broad device compatibility.
-  * `targetSdk = 35` (Android 15 / 16 preview) with mandatory **Edge-to-Edge** layout enforcement (`enableEdgeToEdge`) and dynamic window insets.
-  * **Material You Dynamic Colors**: Automatically adapts to user wallpaper palette on Android 12+.
-* **OriginOS 6+ (vivo / iQOO) Optimization**:
-  * Specialized background keep-alive protocol with `PARTIAL_WAKE_LOCK` burst synchronization.
-  * One-tap direct shortcuts to OriginOS **High Background Power Consumption** and **Auto-start Manager** (`com.vivo.permissionmanager`, `com.iqoo.secure`).
-  * `FOREGROUND_SERVICE_IMMEDIATE` flag preventing background process termination by aggressive OEM task killers.
-* **120Hz / 144Hz LTPO Ultra-Smooth Fluidity**:
-  * Hardware acceleration enabled across all rendering pipelines.
-  * Spring physics animations (`spring(stiffness = 200f)`).
-  * Tactile haptic feedback on all interactions (`LocalHapticFeedback`).
-* **Direct Hardware Communication**:
-  * Communicates directly over the Nordic UART Service (NUS) GATT pipeline.
-  * Thread-safe sequential command queue (`Mutex`) preventing GATT Status 133 collisions.
-* **100% Offline & Private**:
-  * Zero third-party telemetry SDKs (Mixpanel, UserExperior, Firebase stripped out).
-  * Offline-first local health history powered by **Android Room**.
+The guiding rule of this codebase: **never show a value, a state or a success that the watch did not
+actually produce.** Where the protocol cannot confirm something, the UI says so.
 
 ---
+
+## What works
+
+| Area | Status |
+| :--- | :--- |
+| Scan / connect / reconnect over the verified Crrepa GATT profile | Implemented; needs a physical watch to verify end-to-end |
+| "Connected" state | Only after service discovery, notification subscription and a real battery read |
+| Time sync (`0x31`) | Implemented from verified bytecode |
+| Heart rate (`2A37`) | Implemented; BPM comes from the standard characteristic |
+| SpO2 (`0x6B`) | Implemented; only a real reply is stored |
+| Blood pressure (`0x69`) | Probe only; shown only if the unit answers |
+| Live steps (`FEE1`) | Implemented from the verified 3-byte triplet layout |
+| Alarms (`0x11`) | Writes are sent; rows stay **pending** because firmware has no acknowledgement |
+| Find watch (`0x61`) | Sent; reported as **unconfirmed** because the protocol has no reply |
+| Reports (today / 7 days / month) | Local-midnight boundaries, deduplicated, one bucket per calendar day |
+| Diagnostics | Raw TX/RX bytes for every exchange |
+
+## What this app deliberately does not do
+
+* No Gemini/AI answers, API keys, accounts or network calls (there is no `INTERNET` permission).
+* No assistant transcript invention — the vendor SDK exposes no watch→phone transcript channel.
+* No notification scraping, microphone triggers, accessibility tricks or background app reading.
+* No watch-face "flashing", app installation or firmware update.
+* No claims of alarm or find-watch confirmation.
+* No medical interpretation: values come from an optical wrist sensor and can be wrong during motion.
+
+## Design
+
+Graphite/ink neutrals, warm sand in light mode, one copper accent, semantic colours only for data
+(heart, oxygen, motion) and status (positive/warning/critical). No dynamic colour, no decorative
+gradients, no neon. Screens are `LazyColumn`-based with weight-driven metric rows so small phones do
+not clip.
+
+Navigation: Home · Health · Watch · Assistant · More.
+
+## Build
+
+Requires JDK 17 and Android SDK 35.
+
+```bash
+export JAVA_HOME=/path/to/jdk17
+export ANDROID_HOME=/path/to/android-sdk
+./gradlew test lint assembleDebug
+```
+
+Last verified run on 2026-11-01: **37 unit tests pass (0 failures), lint passes with warnings
+only, debug APK builds.** Details in [TEST_MATRIX.md](TEST_MATRIX.md).
+
+Output: `app/build/outputs/apk/debug/app-debug.apk`.
 
 ## Documentation
 
-* [Hardware Protocol Specification](HARDWARE_PROTOCOL.md): Complete byte-level breakdown of GATT services, packet formats, opcodes, and telemetry parsers.
-* [Verification & Testing Guide](VERIFICATION_GUIDE.md): Step-by-step instructions for building, pairing, and verifying all watch capabilities.
+* [PROTOCOL_EVIDENCE.md](PROTOCOL_EVIDENCE.md) — every BLE claim with its bytecode citation and a
+  CONFIRMED / INFERRED / UNKNOWN label.
+* [ROOT_CAUSE_MATRIX.md](ROOT_CAUSE_MATRIX.md) — each previous defect, why it happened, what changed.
+* [APK_COMPARISON.md](APK_COMPARISON.md) — reference vendor APK vs previous app vs this rewrite.
+* [TEST_MATRIX.md](TEST_MATRIX.md) — automated test status and blocked hardware tests.
+* [LIMITATIONS_AND_DEVICE_TESTING.md](LIMITATIONS_AND_DEVICE_TESTING.md) — limitations and a
+  physical-device test plan.
+* [VERIFICATION_GUIDE.md](VERIFICATION_GUIDE.md) — install and first-run steps.
