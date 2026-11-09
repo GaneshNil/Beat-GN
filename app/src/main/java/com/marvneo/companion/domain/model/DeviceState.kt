@@ -66,7 +66,7 @@ data class AlarmModel(
     val id: Int, // watch slot 0..4
     val hour: Int,
     val minute: Int,
-    val repeatDaysMask: Int = 0x7F, // bit0=Monday .. bit6=Sunday
+    val repeatDaysMask: Int = 0x7F, // bit0=Sunday .. bit6=Saturday (see CrrepaProtocol)
     val isEnabled: Boolean = true,
     val label: String = "Alarm"
 )

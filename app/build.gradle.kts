@@ -58,6 +58,12 @@ android {
     }
 }
 
+ksp {
+    // Committed Room schemas make every migration reviewable and let Room's schema diff catch a
+    // mismatch between an entity and its migration.
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -76,4 +82,5 @@ dependencies {
     ksp(libs.androidx.room.compiler)
 
     testImplementation(libs.junit)
+    testImplementation(libs.sqlite.jdbc)
 }

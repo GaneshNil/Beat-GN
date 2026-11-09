@@ -1,5 +1,6 @@
 package com.marvneo.companion.ui.screens
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -10,6 +11,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
@@ -22,7 +24,6 @@ import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Watch
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -49,6 +50,7 @@ import com.marvneo.companion.data.ble.protocol.CrrepaProtocol
 import com.marvneo.companion.data.db.AppDatabase
 import com.marvneo.companion.data.db.entity.AlarmRecord
 import com.marvneo.companion.data.db.entity.AlarmSyncState
+import com.marvneo.companion.domain.model.AlarmSlots
 import com.marvneo.companion.domain.model.CommandOutcome
 import com.marvneo.companion.domain.model.ConnectionState
 import com.marvneo.companion.ui.components.AppCard
@@ -63,7 +65,6 @@ import com.marvneo.companion.ui.components.connectionDetail
 import com.marvneo.companion.ui.components.connectionLabel
 import com.marvneo.companion.ui.theme.Spacing
 import kotlinx.coroutines.launch
-import java.util.Calendar
 
 @Composable
 fun WatchScreen(
@@ -84,6 +85,7 @@ fun WatchScreen(
     val scope = rememberCoroutineScope()
     val ready = connection is ConnectionState.Ready
     var editorSlot by remember { mutableStateOf<AlarmRecord?>(null) }
+    val freeAlarmSlot = AlarmSlots.firstFree(alarms.map { it.id })
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -131,7 +133,7 @@ fun WatchScreen(
                     }
                     OutlinedButton(
                         enabled = bleManager.lastKnownAddress() != null,
-                        onClick = { bleManager.autoConnect() }
+                        onClick = { bleManager.reconnect() }
                     ) {
                         Icon(Icons.Outlined.Refresh, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
@@ -224,7 +226,10 @@ fun WatchScreen(
                 title = "Alarms",
                 subtitle = "Five slots, written to the watch; confirmation is not available",
                 trailing = {
-                    IconButton(onClick = { editorSlot = emptyAlarm(alarms.size) }) {
+                    IconButton(
+                        enabled = freeAlarmSlot != null,
+                        onClick = { freeAlarmSlot?.let { editorSlot = emptyAlarm(it) } }
+                    ) {
                         Icon(Icons.Outlined.Add, contentDescription = "Add alarm")
                     }
                 }
@@ -239,6 +244,27 @@ fun WatchScreen(
                     "marked \"pending confirmation\" until a firmware-level read-back exists.",
                 tone = NoticeTone.INFO
             )
+        }
+
+        item {
+            InlineNotice(
+                title = "Deleting is phone-only",
+                message = "Deleting an alarm removes it from this phone. This build sends no " +
+                    "delete command, so an alarm already written to the watch may keep alerting " +
+                    "there. Disable it here and send, or remove it on the watch itself.",
+                tone = NoticeTone.WARNING
+            )
+        }
+
+        if (freeAlarmSlot == null) {
+            item {
+                InlineNotice(
+                    title = "All five slots are in use",
+                    message = "The watch supports five alarm slots. Delete an alarm on this phone " +
+                        "before adding another.",
+                    tone = NoticeTone.WARNING
+                )
+            }
         }
 
         if (alarms.isEmpty()) {
@@ -264,7 +290,14 @@ fun WatchScreen(
                                 AlarmSyncState.PENDING,
                                 System.currentTimeMillis()
                             )
-                            bleManager.writeAlarm(alarm)
+                            val outcome = bleManager.writeAlarm(alarm)
+                            if (outcome is CommandOutcome.Failed) {
+                                database.healthDao().updateAlarmSyncState(
+                                    alarm.id,
+                                    AlarmSyncState.FAILED,
+                                    System.currentTimeMillis()
+                                )
+                            }
                         }
                     },
                     canSend = ready
@@ -317,7 +350,14 @@ fun WatchScreen(
                     )
                     database.healthDao().upsertAlarm(record)
                     if (bleManager.connectionState.value is ConnectionState.Ready) {
-                        bleManager.writeAlarm(record)
+                        val outcome = bleManager.writeAlarm(record)
+                        if (outcome is CommandOutcome.Failed) {
+                            database.healthDao().updateAlarmSyncState(
+                                record.id,
+                                AlarmSyncState.FAILED,
+                                System.currentTimeMillis()
+                            )
+                        }
                     }
                 }
             }
@@ -409,7 +449,10 @@ private fun AlarmEditorDialog(
                 Spacer(Modifier.height(Spacing.md))
                 Text("Repeat", style = MaterialTheme.typography.labelLarge)
                 Spacer(Modifier.height(Spacing.xs))
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
                     DayChip("S", mask, CrrepaProtocol.REPEAT_SUNDAY) { mask = mask xor it }
                     DayChip("M", mask, CrrepaProtocol.REPEAT_MONDAY) { mask = mask xor it }
                     DayChip("T", mask, CrrepaProtocol.REPEAT_TUESDAY) { mask = mask xor it }
@@ -417,6 +460,15 @@ private fun AlarmEditorDialog(
                     DayChip("T", mask, CrrepaProtocol.REPEAT_THURSDAY) { mask = mask xor it }
                     DayChip("F", mask, CrrepaProtocol.REPEAT_FRIDAY) { mask = mask xor it }
                     DayChip("S", mask, CrrepaProtocol.REPEAT_SATURDAY) { mask = mask xor it }
+                }
+                if (mask == 0) {
+                    Spacer(Modifier.height(Spacing.xs))
+                    Text(
+                        "No days selected. This build cannot send a dated one-off alarm, so this " +
+                            "alarm may never fire.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
                 Spacer(Modifier.height(Spacing.md))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -447,8 +499,7 @@ private fun DayChip(label: String, mask: Int, bit: Int, onToggle: (Int) -> Unit)
     )
 }
 
-private fun emptyAlarm(usedSlots: Int): AlarmRecord {
-    val slot = (0..4).firstOrNull { it >= usedSlots } ?: 0
+private fun emptyAlarm(slot: Int): AlarmRecord {
     return AlarmRecord(
         id = slot,
         hour = 7,
@@ -463,7 +514,7 @@ private fun emptyAlarm(usedSlots: Int): AlarmRecord {
 
 private fun repeatLabel(mask: Int): String = when (mask) {
     CrrepaProtocol.REPEAT_EVERY_DAY -> "Every day"
-    0 -> "Once"
+    0 -> "No days selected (may never fire)"
     else -> {
         val days = listOf(
             "Sun" to CrrepaProtocol.REPEAT_SUNDAY,

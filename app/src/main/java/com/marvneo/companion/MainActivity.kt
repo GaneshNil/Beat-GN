@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -212,6 +213,9 @@ class MainActivity : ComponentActivity() {
         runCatching {
             val intent = Intent(this, WatchCompanionService::class.java)
             ContextCompat.startForegroundService(this, intent)
+        }.onFailure {
+            // No health data or addresses here: only the failure reason.
+            Log.w(TAG, "Could not start the companion service", it)
         }
     }
 
@@ -227,7 +231,10 @@ class MainActivity : ComponentActivity() {
                     data = Uri.parse("package:$packageName")
                 }
             )
-        }.onFailure { openAppDetails() }
+        }.onFailure {
+            Log.w(TAG, "Could not open battery optimization settings", it)
+            openAppDetails()
+        }
     }
 
     private fun openAppDetails() {
@@ -237,8 +244,14 @@ class MainActivity : ComponentActivity() {
                     data = Uri.parse("package:$packageName")
                 }
             )
+        }.onFailure {
+            Log.w(TAG, "Could not open app details settings", it)
         }
     }
 
     private data class Destination(val label: String, val icon: ImageVector)
+
+    private companion object {
+        private const val TAG = "MainActivity"
+    }
 }

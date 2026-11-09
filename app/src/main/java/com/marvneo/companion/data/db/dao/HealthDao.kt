@@ -61,6 +61,12 @@ interface HealthDao {
     @Query("SELECT * FROM blood_pressure_record WHERE timestamp BETWEEN :start AND :end ORDER BY timestamp ASC")
     fun getBloodPressureBetween(start: Long, end: Long): Flow<List<BloodPressureRecord>>
 
+    @Query("SELECT COUNT(*) FROM blood_pressure_record WHERE systolic = :systolic AND diastolic = :diastolic AND timestamp BETWEEN :from AND :to")
+    suspend fun countBloodPressureInWindow(systolic: Int, diastolic: Int, from: Long, to: Long): Int
+
+    @Query("SELECT EXISTS(SELECT 1 FROM blood_pressure_record)")
+    fun hasAnyBloodPressure(): Flow<Boolean>
+
     // ---- Sleep ----
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertSleep(record: SleepRecord): Long

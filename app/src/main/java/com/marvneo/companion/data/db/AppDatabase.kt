@@ -27,7 +27,7 @@ import com.marvneo.companion.data.db.entity.VoiceMessageRecord
         AlarmRecord::class
     ],
     version = 4,
-    exportSchema = false
+    exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun healthDao(): HealthDao
@@ -38,12 +38,13 @@ abstract class AppDatabase : RoomDatabase() {
         private var INSTANCE: AppDatabase? = null
 
         /**
-         * v1 -> v2 shipped as an empty migration in the previous build; kept for databases
-         * already on disk so no user data is dropped.
+         * v1 -> v2 added `voice_messages`. The previous build left this migration empty, so a v1
+         * database failed v2 validation and then failed `ALTER TABLE voice_messages` at v3 -> v4.
+         * The SQL is additive; every v1 health row survives.
          */
         val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                // No structural change was made between these versions.
+                MigrationSql.V1_TO_V2.forEach(db::execSQL)
             }
         }
 
@@ -52,29 +53,7 @@ abstract class AppDatabase : RoomDatabase() {
          */
         val MIGRATION_2_3 = object : Migration(2, 3) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                db.execSQL(
-                    """
-                    CREATE TABLE IF NOT EXISTS `blood_pressure_record` (
-                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-                        `timestamp` INTEGER NOT NULL,
-                        `systolic` INTEGER NOT NULL,
-                        `diastolic` INTEGER NOT NULL
-                    )
-                    """.trimIndent()
-                )
-                db.execSQL(
-                    """
-                    CREATE TABLE IF NOT EXISTS `alarm_record` (
-                        `id` INTEGER NOT NULL,
-                        `hour` INTEGER NOT NULL,
-                        `minute` INTEGER NOT NULL,
-                        `repeatDays` INTEGER NOT NULL,
-                        `isEnabled` INTEGER NOT NULL,
-                        `label` TEXT NOT NULL,
-                        PRIMARY KEY(`id`)
-                    )
-                    """.trimIndent()
-                )
+                MigrationSql.V2_TO_V3.forEach(db::execSQL)
             }
         }
 
@@ -84,15 +63,7 @@ abstract class AppDatabase : RoomDatabase() {
          */
         val MIGRATION_3_4 = object : Migration(3, 4) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                db.execSQL(
-                    "ALTER TABLE `alarm_record` ADD COLUMN `syncState` TEXT NOT NULL DEFAULT 'PENDING'"
-                )
-                db.execSQL(
-                    "ALTER TABLE `alarm_record` ADD COLUMN `updatedAt` INTEGER NOT NULL DEFAULT 0"
-                )
-                db.execSQL(
-                    "ALTER TABLE `voice_messages` ADD COLUMN `sessionId` TEXT"
-                )
+                MigrationSql.V3_TO_V4.forEach(db::execSQL)
             }
         }
 

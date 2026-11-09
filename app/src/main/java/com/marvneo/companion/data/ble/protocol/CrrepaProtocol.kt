@@ -225,7 +225,18 @@ object CrrepaProtocol {
     data class HeartRateState(val state: Int)
     data class SpO2(val percentage: Int)
     data class BloodPressure(val systolic: Int, val diastolic: Int)
-    data class Steps(val steps: Int, val distanceMeters: Int, val calories: Int, val activeMinutes: Int?)
+
+    /**
+     * A step notification. Any field the watch marks as "no value" (all three bytes `0xFF`) is
+     * null; it is never turned into a fabricated zero. A 3-, 6-, 9- or 12-byte payload is accepted,
+     * so a 3-byte step-only notification is not discarded.
+     */
+    data class Steps(
+        val steps: Int?,
+        val distanceMeters: Int?,
+        val calories: Int?,
+        val activeMinutes: Int?
+    )
 
     /** `com.crrepa.l.a#K0`: one byte of measurement state for the 0x6D reply. */
     fun parseHeartRateState(payload: ByteArray): HeartRateState? {
@@ -244,12 +255,17 @@ object CrrepaProtocol {
     /**
      * `com.crrepa.i.b#a`: requires exactly three bytes and reads
      * `systolic = payload[1]`, `diastolic = payload[2]`.
+     *
+     * Physiological bounds and `systolic > diastolic` are enforced here, not only at the call site,
+     * so no caller can persist an implausible pair.
      */
     fun parseBloodPressure(payload: ByteArray): BloodPressure? {
         if (payload.size != 3) return null
         val systolic = payload[1].toInt() and 0xFF
         val diastolic = payload[2].toInt() and 0xFF
-        if (systolic == 0 || diastolic == 0) return null
+        // Both values are single unsigned bytes, so 255 is the highest representable systolic.
+        if (systolic !in 60..255 || diastolic !in 30..160) return null
+        if (systolic <= diastolic) return null
         return BloodPressure(systolic, diastolic)
     }
 
@@ -272,17 +288,25 @@ object CrrepaProtocol {
 
     /**
      * Live step notification on FEE1 (`Lcom/google/android/play/core/appupdate/d;->D([B)`).
-     * The payload is a sequence of 3-byte little-endian values: steps, distance, calories and
-     * optionally active minutes.
+     * The payload is 3, 6, 9 or 12 bytes of 3-byte little-endian values: steps, distance, calories
+     * and optionally active minutes.
+     *
+     * `com.crrepa.n0.a#x([B)` treats an all-`0xFF` 24-bit field as "no value". Preserving that as
+     * null is what keeps `16,777,215` steps out of the UI and the database.
      */
     fun parseSteps(value: ByteArray): Steps? {
-        if (value.isEmpty() || value.size % 3 != 0 || value.size < 9) return null
-        val steps = readUInt24Le(value, 0)
-        val distance = readUInt24Le(value, 3)
-        val calories = readUInt24Le(value, 6)
-        val activeMinutes = if (value.size >= 12) readUInt24Le(value, 9) else null
-        return Steps(steps = steps, distanceMeters = distance, calories = calories, activeMinutes = activeMinutes)
+        if (value.size !in setOf(3, 6, 9, 12)) return null
+        return Steps(
+            steps = readUInt24LeOrNull(value, 0),
+            distanceMeters = if (value.size >= 6) readUInt24LeOrNull(value, 3) else null,
+            calories = if (value.size >= 9) readUInt24LeOrNull(value, 6) else null,
+            activeMinutes = if (value.size >= 12) readUInt24LeOrNull(value, 9) else null
+        )
     }
+
+    /** Returns null for the documented "no value" marker (`0xFF 0xFF 0xFF`). */
+    private fun readUInt24LeOrNull(bytes: ByteArray, offset: Int): Int? =
+        readUInt24Le(bytes, offset).takeUnless { it == 0xFFFFFF }
 
     private fun readUInt24Le(bytes: ByteArray, offset: Int): Int {
         if (offset + 3 > bytes.size) return 0
