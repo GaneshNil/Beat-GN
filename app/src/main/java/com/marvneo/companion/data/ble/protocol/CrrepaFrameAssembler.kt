@@ -50,6 +50,13 @@ class CrrepaFrameAssembler {
                 dropFirst()
                 continue
             }
+            val version = buffer[2].toInt() and 0xFF
+            if (version != CrrepaProtocol.VERSION_1 && version != CrrepaProtocol.VERSION_2) {
+                // A `FE EA` byte pair with an impossible version is not a frame header; resync
+                // instead of buffering up to 255 bytes of unrelated traffic.
+                dropFirst()
+                continue
+            }
             if (buffer.size < declared) break
 
             val packet = ByteArray(declared)

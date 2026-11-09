@@ -1,6 +1,7 @@
 package com.marvneo.companion.ui.screens
 
 import android.os.Build
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -123,7 +124,9 @@ private fun MenuRow(
     onClick: () -> Unit
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -136,9 +139,7 @@ private fun MenuRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
-        IconButton(onClick = onClick) {
-            Icon(Icons.Outlined.ChevronRight, contentDescription = "Open $title")
-        }
+        Icon(Icons.Outlined.ChevronRight, contentDescription = null)
     }
 }
 

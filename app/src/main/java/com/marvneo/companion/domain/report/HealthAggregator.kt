@@ -97,7 +97,7 @@ data class HealthReport(
  * Validity rules (values outside these ranges are treated as sensor errors and excluded):
  *  - heart rate 25..250 bpm
  *  - SpO2       50..100 %
- *  - BP         systolic 60..260, diastolic 30..160, systolic > diastolic
+ *  - BP         systolic 60..255, diastolic 30..160, systolic > diastolic
  */
 object HealthAggregator {
 
@@ -142,7 +142,7 @@ object HealthAggregator {
     fun validBloodPressure(records: List<BloodPressureRecord>): List<BloodPressureRecord> =
         dedupe(records.sortedBy { it.timestamp }, { it.timestamp }, { "${it.systolic}/${it.diastolic}" })
             .filter {
-                it.systolic in 60..260 && it.diastolic in 30..160 && it.systolic > it.diastolic
+                it.systolic in 60..255 && it.diastolic in 30..160 && it.systolic > it.diastolic
             }
 
     fun stats(values: List<Int>): MetricStats {

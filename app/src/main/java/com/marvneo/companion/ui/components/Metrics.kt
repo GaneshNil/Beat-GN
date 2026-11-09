@@ -80,6 +80,26 @@ fun MetricTile(
     }
 }
 
+/**
+ * Which bar labels stay visible for [count] bars.
+ *
+ * Up to seven bars keep every label. With more bars the labels are thinned to roughly six evenly
+ * spaced positions plus the last one, so a 28–31 day month cannot render 31 colliding labels.
+ * The final label is dropped if it would sit next to the previous one.
+ */
+internal fun sparkLabelIndices(count: Int): Set<Int> {
+    if (count <= 7) return (0 until count).toSet()
+    val every = kotlin.math.ceil(count / 6.0).toInt()
+    val indices = ((0 until count) step every).toMutableSet()
+    val last = count - 1
+    indices.add(last)
+    val previous = indices.filter { it != last }.maxOrNull()
+    if (previous != null && previous != 0 && last - previous <= every / 2) {
+        indices.remove(previous)
+    }
+    return indices
+}
+
 /** Horizontal mini bar chart. Values are averages per day; nulls render as empty slots. */
 @Composable
 fun SparkBars(
@@ -90,6 +110,7 @@ fun SparkBars(
     heightDp: Int = 96
 ) {
     val max = values.filterNotNull().maxOrNull() ?: 0.0
+    val labelIndices = sparkLabelIndices(values.size)
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -107,16 +128,16 @@ fun SparkBars(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height((heightDp * 0.72f * fraction).dp.coerceAtLeast(2.dp))
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(
-                            if (value == null) MaterialTheme.colorScheme.surfaceVariant
-                            else accent.copy(alpha = 0.75f)
+                        .height(
+                            if (value == null) 0.dp
+                            else (heightDp * 0.72f * fraction).dp.coerceAtLeast(2.dp)
                         )
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(accent.copy(alpha = 0.75f))
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = labels.getOrElse(index) { "" },
+                    text = if (index in labelIndices) labels.getOrElse(index) { "" } else "",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1

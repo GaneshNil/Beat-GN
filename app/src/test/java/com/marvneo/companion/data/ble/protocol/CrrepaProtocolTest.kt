@@ -263,4 +263,124 @@ class CrrepaProtocolTest {
         assertEquals(CrrepaProtocol.CMD_QUERY_NEW_ALARMS, packet.opcode)
         assertArrayEquals(byteArrayOf(0x15, 0x04), packet.payload)
     }
+
+    // ---------------------------------------------------------------- step payload variants
+
+    @Test
+    fun `a three-byte step payload keeps steps and leaves the other fields null`() {
+        val steps = CrrepaProtocol.parseSteps(byteArrayOf(0x10, 0x00, 0x00))!!
+        assertEquals(16, steps.steps)
+        assertNull(steps.distanceMeters)
+        assertNull(steps.calories)
+        assertNull(steps.activeMinutes)
+    }
+
+    @Test
+    fun `six and twelve byte step payloads map fields in wire order`() {
+        val six = CrrepaProtocol.parseSteps(
+            byteArrayOf(
+                0x10, 0x00, 0x00, // 16 steps
+                0x20, 0x00, 0x00  // 32 metres
+            )
+        )!!
+        assertEquals(16, six.steps)
+        assertEquals(32, six.distanceMeters)
+        assertNull(six.calories)
+        assertNull(six.activeMinutes)
+
+        val twelve = CrrepaProtocol.parseSteps(
+            byteArrayOf(
+                0x10, 0x00, 0x00, // 16 steps
+                0x20, 0x00, 0x00, // 32 metres
+                0x05, 0x00, 0x00, // 5 kcal
+                0x07, 0x00, 0x00  // 7 active minutes
+            )
+        )!!
+        assertEquals(16, twelve.steps)
+        assertEquals(32, twelve.distanceMeters)
+        assertEquals(5, twelve.calories)
+        assertEquals(7, twelve.activeMinutes)
+    }
+
+    @Test
+    fun `an all-FF step field is null rather than 16777215`() {
+        val steps = CrrepaProtocol.parseSteps(
+            byteArrayOf(
+                0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(),
+                0x20, 0x00, 0x00
+            )
+        )!!
+        assertNull(steps.steps)
+        assertEquals(32, steps.distanceMeters)
+    }
+
+    @Test
+    fun `step payload sizes other than 3, 6, 9 and 12 are rejected`() {
+        for (size in listOf(0, 1, 2, 4, 5, 7, 8, 10, 11, 13, 15)) {
+            assertNull("size $size must be rejected", CrrepaProtocol.parseSteps(ByteArray(size)))
+        }
+        assertNotNull(CrrepaProtocol.parseSteps(ByteArray(9)))
+    }
+
+    // ---------------------------------------------------------------- blood-pressure bounds
+
+    @Test
+    fun `blood pressure enforces physiological bounds and systolic above diastolic`() {
+        assertNotNull(CrrepaProtocol.parseBloodPressure(byteArrayOf(0, 60, 30)))
+        // 255 is the largest value a single unsigned byte can carry.
+        assertNotNull(CrrepaProtocol.parseBloodPressure(byteArrayOf(0, 0xFF.toByte(), 160.toByte())))
+        assertNull(CrrepaProtocol.parseBloodPressure(byteArrayOf(0, 59, 30)))
+        assertNull(CrrepaProtocol.parseBloodPressure(byteArrayOf(0, 120, 29)))
+        assertNull(CrrepaProtocol.parseBloodPressure(byteArrayOf(0, 120, 161.toByte())))
+        assertNull(CrrepaProtocol.parseBloodPressure(byteArrayOf(0, 120, 120)))
+        assertNull(CrrepaProtocol.parseBloodPressure(byteArrayOf(0, 80, 90)))
+    }
+
+    @Test
+    fun `blood pressure rejects payloads that are not exactly three bytes`() {
+        assertNull(CrrepaProtocol.parseBloodPressure(ByteArray(0)))
+        assertNull(CrrepaProtocol.parseBloodPressure(byteArrayOf(0, 120)))
+        assertNull(CrrepaProtocol.parseBloodPressure(byteArrayOf(0, 120, 80, 0)))
+    }
+
+    // ---------------------------------------------------------------- heart-rate flags
+
+    @Test
+    fun `sixteen-bit heart rate flag requires a third byte and rejects zero`() {
+        assertNull(CrrepaProtocol.parseHeartRateMeasurement(byteArrayOf(0x01, 0x30)))
+        assertNull(CrrepaProtocol.parseHeartRateMeasurement(byteArrayOf(0x01, 0x00, 0x00)))
+        assertEquals(304, CrrepaProtocol.parseHeartRateMeasurement(byteArrayOf(0x01, 0x30, 0x01)))
+    }
+
+    @Test
+    fun `eight-bit heart rate ignores extra bytes and rejects zero`() {
+        assertEquals(72, CrrepaProtocol.parseHeartRateMeasurement(byteArrayOf(0x00, 72, 9, 9)))
+        assertNull(CrrepaProtocol.parseHeartRateMeasurement(byteArrayOf(0x00, 0)))
+    }
+
+    // ---------------------------------------------------------------- version resync
+
+    @Test
+    fun `a frame header with an unknown version is discarded and the next frame survives`() {
+        val assembler = CrrepaFrameAssembler()
+        val bogus = byteArrayOf(0xFE.toByte(), 0xEA.toByte(), 0x33, 0x05, 0x61)
+        val valid = CrrepaProtocol.frame(CrrepaProtocol.CMD_BLOOD_OXYGEN, byteArrayOf(97))
+
+        val frames = assembler.append(bogus + valid)
+
+        assertEquals(1, frames.size)
+        assertEquals(CrrepaProtocol.CMD_BLOOD_OXYGEN, frames[0].opcode)
+        assertEquals(5, assembler.dropped)
+        assertEquals(0, assembler.pending)
+    }
+
+    @Test
+    fun `a zero version byte is rejected as confidently as an out-of-range one`() {
+        val assembler = CrrepaFrameAssembler()
+        val frames = assembler.append(byteArrayOf(0xFE.toByte(), 0xEA.toByte(), 0x00, 0x05, 0x61))
+        assertTrue(frames.isEmpty())
+        // Only the 0xFE is discarded; the remaining four bytes stay buffered awaiting a header.
+        assertEquals(1, assembler.dropped)
+        assertEquals(4, assembler.pending)
+    }
 }

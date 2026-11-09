@@ -8,6 +8,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -209,5 +210,155 @@ class HealthAggregatorTest {
         assertEquals(70.0, today.heartRateAverage!!, 0.0001)
         assertEquals(2, today.sampleCount)
         assertTrue(report.daily.dropLast(1).all { it.heartRateAverage == null })
+    }
+
+    // ---------------------------------------------------------------- time zones and DST
+
+    @Test
+    fun `the injected zone decides the calendar day, not the machine zone`() {
+        val instant = Instant.parse("2026-03-08T11:30:00Z")
+        val auckland = ZoneId.of("Pacific/Auckland")
+        val utc = ZoneId.of("UTC")
+
+        val aucklandWindow = ReportWindows.of(ReportPeriod.TODAY, instant.toEpochMilli(), auckland)
+        val utcWindow = ReportWindows.of(ReportPeriod.TODAY, instant.toEpochMilli(), utc)
+
+        assertEquals(
+            LocalDate.of(2026, 3, 9),
+            Instant.ofEpochMilli(aucklandWindow.startMillis).atZone(auckland).toLocalDate()
+        )
+        assertEquals(
+            LocalDate.of(2026, 3, 8),
+            Instant.ofEpochMilli(utcWindow.startMillis).atZone(utc).toLocalDate()
+        )
+        assertTrue(aucklandWindow.startMillis != utcWindow.startMillis)
+    }
+
+    @Test
+    fun `a DST spring-forward day is still one calendar bucket and is 23 hours long`() {
+        val newYork = ZoneId.of("America/New_York")
+        // 2026-03-08 is the US spring-forward day (02:00 -> 03:00 local).
+        val now = LocalDateTime.of(2026, 3, 9, 12, 0).atZone(newYork).toInstant().toEpochMilli()
+        val report = HealthAggregator.aggregate(
+            period = ReportPeriod.LAST_7_DAYS,
+            nowMillis = now,
+            zone = newYork,
+            heartRates = listOf(
+                HeartRateRecord(
+                    timestamp = LocalDateTime.of(2026, 3, 8, 3, 30)
+                        .atZone(newYork).toInstant().toEpochMilli(),
+                    bpm = 66
+                )
+            ),
+            bloodOxygen = emptyList(),
+            bloodPressure = emptyList()
+        )
+
+        assertEquals(7, report.daily.size)
+        val dstDay = report.daily[5] // 2026-03-08
+        assertEquals(66.0, dstDay.heartRateAverage!!, 0.0001)
+        val dayAfter = report.daily[6] // 2026-03-09
+        assertEquals(
+            "the spring-forward day is 23 hours, not 24",
+            23 * 60 * 60 * 1000L,
+            dayAfter.dayStartMillis - dstDay.dayStartMillis
+        )
+    }
+
+    @Test
+    fun `a DST fall-back day is still one calendar bucket and is 25 hours long`() {
+        val newYork = ZoneId.of("America/New_York")
+        // 2026-11-01 is the US fall-back day (02:00 -> 01:00 local).
+        val now = LocalDateTime.of(2026, 11, 2, 12, 0).atZone(newYork).toInstant().toEpochMilli()
+        val report = HealthAggregator.aggregate(
+            period = ReportPeriod.LAST_7_DAYS,
+            nowMillis = now,
+            zone = newYork,
+            heartRates = emptyList(),
+            bloodOxygen = emptyList(),
+            bloodPressure = emptyList()
+        )
+
+        assertEquals(7, report.daily.size)
+        val dstDay = report.daily[5] // 2026-11-01
+        val dayAfter = report.daily[6] // 2026-11-02
+        assertEquals(
+            "the fall-back day is 25 hours, not 24",
+            25 * 60 * 60 * 1000L,
+            dayAfter.dayStartMillis - dstDay.dayStartMillis
+        )
+    }
+
+    @Test
+    fun `seven day window crosses a year boundary without losing days`() {
+        val now = at(2027, 1, 2, 12)
+        val window = ReportWindows.of(ReportPeriod.LAST_7_DAYS, now, zone)
+        assertEquals(startOfDay(2026, 12, 27), window.startMillis)
+
+        val report = HealthAggregator.aggregate(
+            period = ReportPeriod.LAST_7_DAYS,
+            nowMillis = now,
+            zone = zone,
+            heartRates = emptyList(),
+            bloodOxygen = emptyList(),
+            bloodPressure = emptyList()
+        )
+        assertEquals(7, report.daily.size)
+        assertEquals(startOfDay(2026, 12, 27), report.daily.first().dayStartMillis)
+        assertEquals(7, report.daily.map { it.dayStartMillis }.distinct().size)
+    }
+
+    @Test
+    fun `an empty seven day report keeps every day null and has no stats`() {
+        val now = at(2026, 3, 9, 12)
+        val report = HealthAggregator.aggregate(
+            period = ReportPeriod.LAST_7_DAYS,
+            nowMillis = now,
+            zone = zone,
+            heartRates = emptyList(),
+            bloodOxygen = emptyList(),
+            bloodPressure = emptyList()
+        )
+
+        assertEquals(7, report.daily.size)
+        assertTrue(report.daily.all { it.heartRateAverage == null && it.spo2Average == null })
+        assertTrue(report.daily.all { it.sampleCount == 0 })
+        assertEquals(0, report.heartRate.count)
+        assertNull(report.heartRate.average)
+        assertFalse(report.bloodPressureSupported)
+        assertTrue(report.heartRateRecords.isEmpty())
+    }
+
+    // ---------------------------------------------------------------- blood-pressure dedupe
+
+    @Test
+    fun `identical blood pressure within three seconds is counted once`() {
+        val base = at(2026, 3, 9, 9)
+        val records = listOf(
+            BloodPressureRecord(timestamp = base, systolic = 120, diastolic = 80),
+            BloodPressureRecord(timestamp = base + 1_000, systolic = 120, diastolic = 80),
+            BloodPressureRecord(timestamp = base + 3_000, systolic = 120, diastolic = 80)
+        )
+        assertEquals(1, HealthAggregator.validBloodPressure(records).size)
+    }
+
+    @Test
+    fun `identical blood pressure after three seconds is kept`() {
+        val base = at(2026, 3, 9, 9)
+        val records = listOf(
+            BloodPressureRecord(timestamp = base, systolic = 120, diastolic = 80),
+            BloodPressureRecord(timestamp = base + 3_001, systolic = 120, diastolic = 80)
+        )
+        assertEquals(2, HealthAggregator.validBloodPressure(records).size)
+    }
+
+    @Test
+    fun `different blood pressure close together is kept`() {
+        val base = at(2026, 3, 9, 9)
+        val records = listOf(
+            BloodPressureRecord(timestamp = base, systolic = 120, diastolic = 80),
+            BloodPressureRecord(timestamp = base + 1_000, systolic = 118, diastolic = 78)
+        )
+        assertEquals(2, HealthAggregator.validBloodPressure(records).size)
     }
 }

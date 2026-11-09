@@ -69,6 +69,7 @@ fun HealthScreen(
     val spo2State by bleManager.spo2Measurement.collectAsState()
     val bpState by bleManager.bloodPressureMeasurement.collectAsState()
     val bpEverReported by bleManager.bloodPressureEverReported.collectAsState()
+    val bpEverStored by healthRepository.bloodPressureEverRecorded.collectAsState(initial = false)
 
     val scope = rememberCoroutineScope()
     val ready = connection is ConnectionState.Ready
@@ -185,7 +186,7 @@ fun HealthScreen(
         }
 
         item {
-            BloodPressureCard(report = report, everReported = bpEverReported)
+            BloodPressureCard(report = report, everReported = bpEverReported || bpEverStored)
         }
 
         val daily = report?.daily.orEmpty()

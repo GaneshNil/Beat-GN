@@ -108,7 +108,6 @@ class MarvNeoBleManager(
     private var connectTimeoutJob: Job? = null
     private var reconnectJob: Job? = null
     private var heartbeatJob: Job? = null
-    private var measurementTimeoutJob: Job? = null
 
     // ---- Observable connection state ----
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
@@ -163,6 +162,14 @@ class MarvNeoBleManager(
     private val gattOpMutex = Mutex()
     private var pendingGattOp: CompletableDeferred<Boolean>? = null
 
+    private enum class MeasurementKind { HEART_RATE, SPO2, BLOOD_PRESSURE }
+
+    /**
+     * One timeout job per measurement. A single shared job used to let starting Pulse cancel the
+     * Oxygen timeout (and vice versa), leaving a request "Measuring…" forever.
+     */
+    private val measurementTimeouts = ConcurrentHashMap<MeasurementKind, Job>()
+
     /** Chunked inbound packet reassembly, mirroring `com.crrepa.l.a#n0`. */
     private val rxAssembler = CrrepaFrameAssembler()
 
@@ -180,11 +187,19 @@ class MarvNeoBleManager(
 
     private val gattCallback = object : BluetoothGattCallback() {
 
+        /**
+         * A late callback from a closed connection must never release the single-operation mutex
+         * or feed data into the current session. Every callback below starts with this guard.
+         */
+        private fun isCurrent(gatt: BluetoothGatt, what: String): Boolean {
+            if (gatt === this@MarvNeoBleManager.gatt) return true
+            log("Ignoring stale $what callback from an earlier GATT connection")
+            runCatching { gatt.close() }
+            return false
+        }
+
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (gatt !== this@MarvNeoBleManager.gatt) {
-                runCatching { gatt.close() } // stale callback from an earlier connection
-                return
-            }
+            if (!isCurrent(gatt, "connection-state")) return
             log("onConnectionStateChange status=$status newState=$newState")
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -208,6 +223,7 @@ class MarvNeoBleManager(
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (!isCurrent(gatt, "MTU")) return
             val effective = if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23
             negotiatedMtu.value = effective
             log("MTU now $effective (status $status)")
@@ -215,6 +231,7 @@ class MarvNeoBleManager(
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (!isCurrent(gatt, "service-discovery")) return
             log("onServicesDiscovered status=$status (${gatt.services.size} services)")
             completeGattOp(status == BluetoothGatt.GATT_SUCCESS)
         }
@@ -224,6 +241,7 @@ class MarvNeoBleManager(
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
+            if (!isCurrent(gatt, "descriptor-write")) return
             log("CCCD write ${descriptor.characteristic.uuid} status=$status")
             completeGattOp(status == BluetoothGatt.GATT_SUCCESS)
         }
@@ -233,6 +251,7 @@ class MarvNeoBleManager(
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            if (!isCurrent(gatt, "characteristic-write")) return
             completeGattOp(status == BluetoothGatt.GATT_SUCCESS)
         }
 
@@ -242,7 +261,31 @@ class MarvNeoBleManager(
             value: ByteArray,
             status: Int
         ) {
+            if (!isCurrent(gatt, "characteristic-read")) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                handleReadValue(characteristic, value)
+                completeGattOp(true)
+            } else {
+                log("Read ${characteristic.uuid} failed status=$status")
+                completeGattOp(false)
+            }
+        }
+
+        /**
+         * Android 11/12 (API 30-32) deliver reads through this three-argument callback. The
+         * four-argument overload only exists from API 33, but `minSdk` is 30: without this override
+         * reads never complete and the link could never reach `Ready`.
+         */
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (!isCurrent(gatt, "legacy-characteristic-read")) return
+            @Suppress("DEPRECATION")
+            val value = characteristic.value
+            if (status == BluetoothGatt.GATT_SUCCESS && value != null) {
                 handleReadValue(characteristic, value)
                 completeGattOp(true)
             } else {
@@ -256,6 +299,7 @@ class MarvNeoBleManager(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
+            if (!isCurrent(gatt, "notification")) return
             handleNotification(characteristic, value)
         }
 
@@ -264,6 +308,7 @@ class MarvNeoBleManager(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
+            if (!isCurrent(gatt, "legacy-notification")) return
             @Suppress("DEPRECATION")
             characteristic.value?.let { handleNotification(characteristic, it) }
         }
@@ -332,6 +377,8 @@ class MarvNeoBleManager(
 
         if (_isScanning.value) stopScan()
 
+        // Scanning is an explicit user action; it clears a previous intentional disconnect.
+        userDisconnected = false
         _discoveredDevices.value = emptyList()
         _isScanning.value = true
         _connectionState.value = ConnectionState.Scanning()
@@ -358,11 +405,10 @@ class MarvNeoBleManager(
         scanTimeoutJob?.cancel()
         scanTimeoutJob = scope.launch {
             delay(SCAN_DURATION_MS)
+            val wasScanning = _connectionState.value is ConnectionState.Scanning ||
+                _connectionState.value is ConnectionState.WatchFound
             stopScan()
-            if (_connectionState.value is ConnectionState.Scanning) {
-                _connectionState.value = ConnectionState.Disconnected
-                log("Scan finished without connecting")
-            }
+            if (wasScanning) log("Scan finished without connecting")
         }
     }
 
@@ -373,6 +419,12 @@ class MarvNeoBleManager(
             scanCallbackActive = false
         }
         _isScanning.value = false
+        // Leaving the state at Scanning after "Stop scan" made the UI claim an active scan.
+        if (_connectionState.value is ConnectionState.Scanning ||
+            _connectionState.value is ConnectionState.WatchFound
+        ) {
+            _connectionState.value = ConnectionState.Disconnected
+        }
     }
 
     private fun handleScanResult(result: ScanResult) {
@@ -425,6 +477,9 @@ class MarvNeoBleManager(
 
     /** Connects to the last known watch, or to a bonded watch, without scanning. */
     fun autoConnect(): Boolean {
+        // An explicit Disconnect must survive the service being restarted or the app returning to
+        // the foreground. Only a user action (scan or [reconnect]) clears this flag.
+        if (userDisconnected) return false
         if (!hasPermissions()) return false
         val adapter = adapter ?: return false
         if (!adapter.isEnabled) {
@@ -449,6 +504,15 @@ class MarvNeoBleManager(
         return false
     }
 
+    /**
+     * User-initiated reconnect (the Watch screen's "Reconnect" button). Unlike [autoConnect] it
+     * explicitly overrides a previous Disconnect.
+     */
+    fun reconnect(): Boolean {
+        userDisconnected = false
+        return autoConnect()
+    }
+
     private fun ConnectionState.inProgress(): Boolean = when (this) {
         is ConnectionState.Ready,
         is ConnectionState.Connecting,
@@ -459,6 +523,14 @@ class MarvNeoBleManager(
     }
 
     fun connect(address: String) {
+        connectInternal(address, isReconnect = false)
+    }
+
+    /**
+     * @param isReconnect true only for a retry scheduled by [scheduleReconnect]. A scheduled retry
+     * must not reset [reconnectAttempt], otherwise `MAX_RECONNECT_ATTEMPTS` is never reached.
+     */
+    private fun connectInternal(address: String, isReconnect: Boolean) {
         if (address.isBlank()) return
         if (!hasPermissions()) {
             _connectionState.value =
@@ -481,7 +553,9 @@ class MarvNeoBleManager(
             return
         }
 
-        if (address.equals(connectedDeviceAddress.value, ignoreCase = true) && gatt != null) {
+        if (!isReconnect &&
+            address.equals(connectedDeviceAddress.value, ignoreCase = true) && gatt != null
+        ) {
             log("Already handling $address; ignoring duplicate connect")
             return
         }
@@ -489,7 +563,7 @@ class MarvNeoBleManager(
         stopScan()
         userDisconnected = false
         targetAddress = address
-        reconnectAttempt = 0
+        if (!isReconnect) reconnectAttempt = 0
         reconnectJob?.cancel()
 
         closeGatt()
@@ -502,7 +576,7 @@ class MarvNeoBleManager(
         connectedDeviceName.value = name
         connectedDeviceAddress.value = address
         _connectionState.value = ConnectionState.Connecting(name, address)
-        log("Connecting to $name ($address)")
+        log("Connecting to $name (${redactAddress(address)})")
 
         connectTimeoutJob?.cancel()
         connectTimeoutJob = scope.launch {
@@ -645,6 +719,8 @@ class MarvNeoBleManager(
                         return@launch
                     }
                 }
+                // Keep trying at a bounded cadence instead of giving up on an Unstable link.
+                if (_connectionState.value is ConnectionState.Unstable) startHeartbeat()
             }
             return
         }
@@ -679,7 +755,8 @@ class MarvNeoBleManager(
         readBattery()
     }
 
-    private var notifyConfirmed: MutableSet<java.util.UUID> = mutableSetOf()
+    private val notifyConfirmed: MutableSet<java.util.UUID> =
+        ConcurrentHashMap.newKeySet()
 
     private fun startedNotify(c: BluetoothGattCharacteristic): Boolean =
         notifyConfirmed.contains(c.uuid)
@@ -822,7 +899,9 @@ class MarvNeoBleManager(
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             delay(delayMs)
-            if (!userDisconnected && targetAddress != null) connect(address)
+            if (!userDisconnected && targetAddress != null) {
+                connectInternal(address, isReconnect = true)
+            }
         }
     }
 
@@ -841,7 +920,28 @@ class MarvNeoBleManager(
         pendingGattOp = null
         negotiatedMtu.value = 0
         rxAssembler.reset()
+
+        // Live telemetry belongs to a link. Keeping the last values after a disconnect made the
+        // Home screen present stale measurements as "live". Historical rows stay in Room.
+        stepsFlow.value = 0
+        caloriesFlow.value = 0
+        distanceFlow.value = 0
+        heartRateFlow.value = 0
+        spO2Flow.value = 0
+        bloodPressureFlow.value = null
+        batteryFlow.value = 0
+        batteryKnown.value = false
+        isChargingFlow.value = false
+        firmwareVersion.value = null
+        modelNumber.value = null
+        manufacturerName.value = null
+        lastCommunicationTimestamp.value = 0
+        lastStoredSteps = -1
     }
+
+    /** Diagnostics keep only a short suffix; the full MAC is shown on the Device information page. */
+    private fun redactAddress(address: String): String =
+        if (address.length <= 5) "…" else "…${address.takeLast(5)}"
 
     // ------------------------------------------------------------------ GATT operation queue
 
@@ -962,6 +1062,7 @@ class MarvNeoBleManager(
                 CrrepaProtocol.parseBloodOxygen(frame.payload)?.let { spo2 ->
                     spO2Flow.value = spo2.percentage
                     completeMeasurement(
+                        MeasurementKind.SPO2,
                         spo2Measurement,
                         MeasurementState.Completed(spo2.percentage)
                     )
@@ -977,6 +1078,7 @@ class MarvNeoBleManager(
                         bloodPressureEverReported.value = true
                         bloodPressureFlow.value = bp.systolic to bp.diastolic
                         completeMeasurement(
+                            MeasurementKind.BLOOD_PRESSURE,
                             bloodPressureMeasurement,
                             MeasurementState.Completed(bp.systolic, bp.diastolic)
                         )
@@ -1018,25 +1120,36 @@ class MarvNeoBleManager(
         if (heartRateMeasurement.value is MeasurementState.InProgress ||
             heartRateMeasurement.value is MeasurementState.Requesting
         ) {
-            completeMeasurement(heartRateMeasurement, MeasurementState.Completed(bpm))
+            completeMeasurement(
+                MeasurementKind.HEART_RATE,
+                heartRateMeasurement,
+                MeasurementState.Completed(bpm)
+            )
         }
         scope.launch { healthRepository.recordHeartRate(bpm) }
     }
 
     private fun onSteps(steps: CrrepaProtocol.Steps) {
-        stepsFlow.value = steps.steps
-        distanceFlow.value = steps.distanceMeters
-        caloriesFlow.value = steps.calories
+        // Only update a field the watch actually reported; never write a fabricated zero.
+        steps.steps?.let { stepsFlow.value = it }
+        steps.distanceMeters?.let { distanceFlow.value = it }
+        steps.calories?.let { caloriesFlow.value = it }
         lastCommunicationTimestamp.value = System.currentTimeMillis()
-        if (steps.steps == lastStoredSteps) return
-        lastStoredSteps = steps.steps
+
+        // A persisted snapshot needs steps, distance and calories together. A 3- or 6-byte
+        // notification (or an all-0xFF field) updates the live value but is not a full snapshot.
+        val stepCount = steps.steps ?: return
+        val distance = steps.distanceMeters ?: return
+        val calories = steps.calories ?: return
+        if (stepCount == lastStoredSteps) return
+        lastStoredSteps = stepCount
         scope.launch {
             healthDao.insertStep(
                 StepRecord(
                     timestamp = System.currentTimeMillis(),
-                    steps = steps.steps,
-                    calories = steps.calories,
-                    distanceMeters = steps.distanceMeters
+                    steps = stepCount,
+                    calories = calories,
+                    distanceMeters = distance
                 )
             )
             healthRepository.requestRefresh()
@@ -1047,10 +1160,11 @@ class MarvNeoBleManager(
     private var lastStoredSteps = -1
 
     private fun completeMeasurement(
+        kind: MeasurementKind,
         target: MutableStateFlow<MeasurementState>,
         state: MeasurementState
     ) {
-        measurementTimeoutJob?.cancel()
+        cancelMeasurementTimeout(kind)
         target.value = state
     }
 
@@ -1060,7 +1174,7 @@ class MarvNeoBleManager(
                 flow.value = MeasurementState.Failed(reason)
             }
         }
-        measurementTimeoutJob?.cancel()
+        MeasurementKind.values().forEach(::cancelMeasurementTimeout)
     }
 
     // ------------------------------------------------------------------ public commands
@@ -1090,11 +1204,19 @@ class MarvNeoBleManager(
             return
         }
         heartRateMeasurement.value = MeasurementState.InProgress(System.currentTimeMillis())
-        armMeasurementTimeout(heartRateMeasurement, MEASUREMENT_TIMEOUT_MS)
+        armMeasurementTimeout(
+            MeasurementKind.HEART_RATE,
+            heartRateMeasurement,
+            MEASUREMENT_TIMEOUT_MS
+        ) {
+            if (_connectionState.value is ConnectionState.Ready) {
+                writePacket(CrrepaProtocol.heartRateMeasurement(false))
+            }
+        }
     }
 
     suspend fun stopHeartRateMeasurement() {
-        measurementTimeoutJob?.cancel()
+        cancelMeasurementTimeout(MeasurementKind.HEART_RATE)
         heartRateMeasurement.value = MeasurementState.Idle
         writePacket(CrrepaProtocol.heartRateMeasurement(false))
     }
@@ -1110,11 +1232,15 @@ class MarvNeoBleManager(
             return
         }
         spo2Measurement.value = MeasurementState.InProgress(System.currentTimeMillis())
-        armMeasurementTimeout(spo2Measurement, SPO2_TIMEOUT_MS)
+        armMeasurementTimeout(MeasurementKind.SPO2, spo2Measurement, SPO2_TIMEOUT_MS) {
+            if (_connectionState.value is ConnectionState.Ready) {
+                writePacket(CrrepaProtocol.bloodOxygenMeasurement(false))
+            }
+        }
     }
 
     suspend fun stopSpO2Measurement() {
-        measurementTimeoutJob?.cancel()
+        cancelMeasurementTimeout(MeasurementKind.SPO2)
         spo2Measurement.value = MeasurementState.Idle
         writePacket(CrrepaProtocol.bloodOxygenMeasurement(false))
     }
@@ -1135,27 +1261,43 @@ class MarvNeoBleManager(
             return
         }
         bloodPressureMeasurement.value = MeasurementState.InProgress(System.currentTimeMillis())
-        measurementTimeoutJob?.cancel()
-        measurementTimeoutJob = scope.launch {
-            delay(BP_TIMEOUT_MS)
-            if (bloodPressureMeasurement.value is MeasurementState.InProgress) {
-                bloodPressureMeasurement.value = MeasurementState.NotSupported
-                log("No blood-pressure response within ${BP_TIMEOUT_MS / 1000}s; marking unsupported")
+        armMeasurementTimeout(
+            MeasurementKind.BLOOD_PRESSURE,
+            bloodPressureMeasurement,
+            BP_TIMEOUT_MS
+        ) {
+            bloodPressureMeasurement.value = MeasurementState.NotSupported
+            log("No blood-pressure response within ${BP_TIMEOUT_MS / 1000}s; marking unsupported")
+            if (_connectionState.value is ConnectionState.Ready) {
+                writePacket(CrrepaProtocol.bloodPressureMeasurement(false))
             }
         }
     }
 
-    private fun armMeasurementTimeout(target: MutableStateFlow<MeasurementState>, timeoutMs: Long) {
-        measurementTimeoutJob?.cancel()
-        measurementTimeoutJob = scope.launch {
+    private fun armMeasurementTimeout(
+        kind: MeasurementKind,
+        target: MutableStateFlow<MeasurementState>,
+        timeoutMs: Long,
+        onTimeout: suspend () -> Unit = {}
+    ) {
+        cancelMeasurementTimeout(kind)
+        val job = scope.launch {
             delay(timeoutMs)
-            if (target.value is MeasurementState.InProgress || target.value is MeasurementState.Requesting) {
+            val state = target.value
+            if (state is MeasurementState.InProgress || state is MeasurementState.Requesting) {
                 target.value = MeasurementState.TimedOut(
                     "No reading received within ${timeoutMs / 1000}s"
                 )
-                log("Measurement timed out")
+                log("Measurement ${kind.name.lowercase()} timed out")
+                onTimeout()
             }
+            coroutineContext[Job]?.let { measurementTimeouts.remove(kind, it) }
         }
+        measurementTimeouts[kind] = job
+    }
+
+    private fun cancelMeasurementTimeout(kind: MeasurementKind) {
+        measurementTimeouts.remove(kind)?.cancel()
     }
 
     /**
@@ -1219,17 +1361,31 @@ class MarvNeoBleManager(
         heartbeatJob = scope.launch {
             while (isActive) {
                 delay(HEARTBEAT_INTERVAL_MS)
-                if (_connectionState.value !is ConnectionState.Ready) return@launch
-                readBattery()
-                delay(2_000)
-                val silentFor = System.currentTimeMillis() - lastCommunicationTimestamp.value
-                if (silentFor > 75_000) {
-                    log("No traffic from watch for ${silentFor}ms")
-                    _connectionState.value = ConnectionState.Unstable(
-                        "No traffic from the watch for over a minute",
-                        lastVerifiedAt = lastCommunicationTimestamp.value.takeIf { it > 0 },
-                        connected = true
-                    )
+                when (val state = _connectionState.value) {
+                    is ConnectionState.Ready -> {
+                        readBattery()
+                        delay(2_000)
+                        val silentFor = System.currentTimeMillis() - lastCommunicationTimestamp.value
+                        if (silentFor > 75_000) {
+                            log("No traffic from watch for ${silentFor}ms")
+                            _connectionState.value = ConnectionState.Unstable(
+                                "No traffic from the watch for over a minute",
+                                lastVerifiedAt = lastCommunicationTimestamp.value.takeIf { it > 0 },
+                                connected = true
+                            )
+                        }
+                    }
+
+                    is ConnectionState.Unstable -> {
+                        // Recovery path: prove the link with a real read before publishing Ready.
+                        val current = gatt ?: return@launch
+                        if (verifyLink()) {
+                            publishReady(current)
+                            return@launch
+                        }
+                    }
+
+                    else -> return@launch
                 }
             }
         }
