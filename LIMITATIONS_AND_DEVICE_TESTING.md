@@ -9,7 +9,8 @@
 | Alarm actually stored/fired by the watch | Firmware sends no acknowledgement for `0x11` | **UNOBSERVABLE** |
 | Find-watch actually vibrating | No reply opcode for `0x61` | **UNOBSERVABLE** |
 | Blood pressure on this specific unit | Hardware may not implement `0x69` | **UNKNOWN until tested** |
-| Room migration on a real v3 database | No v3 database fixture was captured | **BLOCKED** (migration is additive SQL and unit-reviewable) |
+| Room migration through the Android framework on a device | No emulator/device is attached | **BLOCKED** — the exact shipped SQL is applied to a real SQLite v1→v4 database by `MigrationSqlTest` (6 tests) on the JVM |
+| Applying a migration to a captured v3 database file | No v3 fixture was captured | **BLOCKED** (the migration is additive and the full v1→v4 chain is tested) |
 
 Nothing above is reported as passing.
 
@@ -26,6 +27,11 @@ Nothing above is reported as passing.
 6. **Blood pressure is opt-in evidence.** The request is sent only when the user taps "BP probe"; the
    card says "never received" unless a real 3-byte reply arrived.
 7. **Sleep and stress are not shown.** History sync was not verified, so no screen pretends to have it.
+8. **Alarm deletion is phone-only.** No delete opcode is documented, so deleting a row cannot remove
+   the alarm already stored on the watch. The UI says this explicitly; do not assume the watch was
+   changed.
+9. **Blood-pressure bounds stop at 255 systolic.** Both BP fields are single unsigned bytes, so
+   values above 255 cannot arrive from this characteristic.
 
 ## 3. Physical-device test plan
 

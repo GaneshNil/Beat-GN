@@ -52,8 +52,10 @@ export ANDROID_HOME=/path/to/android-sdk
 ./gradlew test lint assembleDebug
 ```
 
-Last verified run on 2026-11-01: **37 unit tests pass (0 failures), lint passes with warnings
-only, debug APK builds.** Details in [TEST_MATRIX.md](TEST_MATRIX.md).
+Last verified run on 2026-11-09: **75 unit tests pass (0 failures, 0 errors, 0 skipped), lint
+reports 0 errors and 35 warnings, debug APK builds.** Details and the APK SHA-256 are in
+[TEST_MATRIX.md](TEST_MATRIX.md). Bluetooth, alarm and rendering behaviour still require the
+physical-device plan in [LIMITATIONS_AND_DEVICE_TESTING.md](LIMITATIONS_AND_DEVICE_TESTING.md).
 
 Output: `app/build/outputs/apk/debug/app-debug.apk`.
 
