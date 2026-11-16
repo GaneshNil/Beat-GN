@@ -53,8 +53,9 @@ data class SleepRecord(
 /**
  * Alarm slots mirrored from the phone. [syncState] is the honest record of what the watch
  * has acknowledged:
- *  - PENDING  : stored on the phone, not yet acknowledged by the watch
- *  - SYNCED   : watch acknowledged the write in this session
+ *  - PENDING  : locally saved or write in progress
+ *  - SENT    : Android reported a successful write callback
+ *  - SYNCED  : reserved for a firmware-confirmed result
  *  - FAILED   : last write attempt timed out / errored
  * "Pending" is never displayed as "synced".
  */
@@ -72,6 +73,7 @@ data class AlarmRecord(
 
 object AlarmSyncState {
     const val PENDING = "PENDING"
+    const val SENT = "SENT"
     const val SYNCED = "SYNCED"
     const val FAILED = "FAILED"
 }

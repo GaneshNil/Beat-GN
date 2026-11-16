@@ -102,8 +102,7 @@ fun KeyValueRow(
     label: String,
     value: String,
     modifier: Modifier = Modifier,
-    valueColor: Color = MaterialTheme.colorScheme.onSurface,
-    monospace: Boolean = false
+    valueColor: Color = MaterialTheme.colorScheme.onSurface
 ) {
     Row(
         modifier = modifier
@@ -140,8 +139,7 @@ fun InlineNotice(
     title: String,
     message: String,
     tone: NoticeTone = NoticeTone.INFO,
-    modifier: Modifier = Modifier,
-    icon: ImageVector? = null
+    modifier: Modifier = Modifier
 ) {
     val accent = when (tone) {
         NoticeTone.INFO -> MaterialTheme.colorScheme.primary

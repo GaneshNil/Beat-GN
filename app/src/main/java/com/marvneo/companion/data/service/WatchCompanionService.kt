@@ -13,6 +13,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Binder
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.marvneo.companion.MainActivity
@@ -40,6 +41,8 @@ class WatchCompanionService : Service() {
 
     private val channelId = "watch_link"
     private val notificationId = 101
+    private var receiverRegistered = false
+    private var foregroundStarted = false
 
     private val adapterReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -60,15 +63,27 @@ class WatchCompanionService : Service() {
     override fun onCreate() {
         super.onCreate()
         bleManager = (application as MarvNeoApp).bleManager
+        if (!bleManager.hasPermissions()) {
+            stopSelf()
+            return
+        }
         createChannel()
-        startForeground(notificationId, buildNotification("Starting…"))
+        try {
+            startForeground(notificationId, buildNotification("Starting…"))
+            foregroundStarted = true
+        } catch (error: RuntimeException) {
+            Log.w("WatchCompanionService", "Foreground start failed (${error.javaClass.simpleName})")
+            stopSelf()
+            return
+        }
 
         ContextCompat.registerReceiver(
             this,
             adapterReceiver,
             IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
-            ContextCompat.RECEIVER_NOT_EXPORTED
+            ContextCompat.RECEIVER_EXPORTED
         )
+        receiverRegistered = true
 
         scope.launch {
             bleManager.connectionState.collectLatest { state ->
@@ -78,20 +93,20 @@ class WatchCompanionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val address = intent?.getStringExtra("MAC_ADDRESS")
-        if (!address.isNullOrBlank()) {
-            bleManager.connect(address)
-        } else if (bleManager.hasPermissions()) {
-            bleManager.autoConnect()
+        if (!foregroundStarted || !bleManager.hasPermissions()) {
+            stopSelf()
+            return START_NOT_STICKY
         }
+        bleManager.autoConnect()
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
-        runCatching { unregisterReceiver(adapterReceiver) }
+        if (receiverRegistered) unregisterReceiver(adapterReceiver)
         scope.coroutineContext.cancel()
+        if (foregroundStarted) bleManager.onServiceStopped()
         super.onDestroy()
     }
 

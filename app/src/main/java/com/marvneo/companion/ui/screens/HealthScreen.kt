@@ -1,5 +1,7 @@
 package com.marvneo.companion.ui.screens
 
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -23,11 +25,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,28 +53,29 @@ import com.marvneo.companion.ui.theme.HeartCoral
 import com.marvneo.companion.ui.theme.OxygenTeal
 import com.marvneo.companion.ui.theme.PressureSteel
 import com.marvneo.companion.ui.theme.Spacing
-import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun HealthScreen(
     bleManager: MarvNeoBleManager,
     healthRepository: HealthRepository,
     onOpenWatch: () -> Unit
 ) {
-    var period by remember { mutableStateOf(ReportPeriod.TODAY) }
-    val report by remember(period) { healthRepository.report(period) }.collectAsState(initial = null)
-    val connection by bleManager.connectionState.collectAsState()
-    val hrState by bleManager.heartRateMeasurement.collectAsState()
-    val spo2State by bleManager.spo2Measurement.collectAsState()
-    val bpState by bleManager.bloodPressureMeasurement.collectAsState()
-    val bpEverReported by bleManager.bloodPressureEverReported.collectAsState()
-    val bpEverStored by healthRepository.bloodPressureEverRecorded.collectAsState(initial = false)
+    var period by rememberSaveable { mutableStateOf(ReportPeriod.TODAY) }
+    val report by remember(period) { healthRepository.report(period) }.collectAsStateWithLifecycle(initialValue = null)
+    val currentReport = report?.takeIf { it.period == period }
+    val connection by bleManager.connectionState.collectAsStateWithLifecycle()
+    val hrState by bleManager.heartRateMeasurement.collectAsStateWithLifecycle()
+    val spo2State by bleManager.spo2Measurement.collectAsStateWithLifecycle()
+    val bpState by bleManager.bloodPressureMeasurement.collectAsStateWithLifecycle()
+    val bpEverReported by bleManager.bloodPressureEverReported.collectAsStateWithLifecycle()
+    val bpEverStored by healthRepository.bloodPressureEverRecorded.collectAsStateWithLifecycle(initialValue = false)
 
-    val scope = rememberCoroutineScope()
     val ready = connection is ConnectionState.Ready
+    val pulseAvailable by bleManager.pulseAvailable.collectAsStateWithLifecycle()
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -92,7 +95,7 @@ fun HealthScreen(
         }
 
         item {
-            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
                 PeriodChip("Today", period == ReportPeriod.TODAY) { period = ReportPeriod.TODAY }
                 PeriodChip("7 days", period == ReportPeriod.LAST_7_DAYS) { period = ReportPeriod.LAST_7_DAYS }
                 PeriodChip("Month", period == ReportPeriod.THIS_MONTH) { period = ReportPeriod.THIS_MONTH }
@@ -101,7 +104,7 @@ fun HealthScreen(
 
         item {
             Text(
-                text = report?.window?.description ?: "Loading window…",
+                text = currentReport?.window?.description ?: "Loading window…",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -122,26 +125,26 @@ fun HealthScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(Modifier.height(Spacing.md))
-                Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
                     OutlinedButton(
-                        enabled = ready,
-                        onClick = { scope.launch { bleManager.startHeartRateMeasurement() } }
+                        enabled = ready && !hrState.active && pulseAvailable,
+                        onClick = bleManager::startHeartRateMeasurement
                     ) {
                         Icon(Icons.Outlined.FavoriteBorder, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
                         Text("Pulse")
                     }
                     OutlinedButton(
-                        enabled = ready,
-                        onClick = { scope.launch { bleManager.startSpO2Measurement() } }
+                        enabled = ready && !spo2State.active,
+                        onClick = bleManager::startSpO2Measurement
                     ) {
                         Icon(Icons.Outlined.Bloodtype, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
                         Text("Oxygen")
                     }
                     OutlinedButton(
-                        enabled = ready,
-                        onClick = { scope.launch { bleManager.probeBloodPressure() } }
+                        enabled = ready && !bpState.active,
+                        onClick = bleManager::probeBloodPressure
                     ) {
                         Icon(Icons.Outlined.MonitorHeart, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
@@ -149,6 +152,9 @@ fun HealthScreen(
                     }
                 }
                 Spacer(Modifier.height(Spacing.sm))
+                if (ready && !pulseAvailable) {
+                    Text("Heart-rate notifications are unavailable on this link.")
+                }
                 MeasurementLine("Heart rate", hrState)
                 MeasurementLine("Blood oxygen", spo2State)
                 MeasurementLine("Blood pressure", bpState)
@@ -168,17 +174,17 @@ fun HealthScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(Spacing.md)) {
                 MetricTile(
                     title = "Heart rate",
-                    value = report?.heartRate?.formatAverage() ?: "—",
-                    unit = if (report?.heartRate?.hasData == true) "bpm" else null,
-                    caption = report?.heartRate?.summary() ?: "No readings in this period",
+                    value = currentReport?.heartRate?.formatAverage() ?: "—",
+                    unit = if (currentReport?.heartRate?.hasData == true) "bpm" else null,
+                    caption = currentReport?.heartRate?.summary() ?: "No readings in this period",
                     accent = HeartCoral,
                     modifier = Modifier.weight(1f)
                 )
                 MetricTile(
                     title = "Blood oxygen",
-                    value = report?.spo2?.formatAverage() ?: "—",
-                    unit = if (report?.spo2?.hasData == true) "%" else null,
-                    caption = report?.spo2?.summary() ?: "No readings in this period",
+                    value = currentReport?.spo2?.formatAverage() ?: "—",
+                    unit = if (currentReport?.spo2?.hasData == true) "%" else null,
+                    caption = currentReport?.spo2?.summary() ?: "No readings in this period",
                     accent = OxygenTeal,
                     modifier = Modifier.weight(1f)
                 )
@@ -186,21 +192,21 @@ fun HealthScreen(
         }
 
         item {
-            BloodPressureCard(report = report, everReported = bpEverReported || bpEverStored)
+            BloodPressureCard(report = currentReport, everReported = bpEverReported || bpEverStored)
         }
 
-        val daily = report?.daily.orEmpty()
+        val daily = currentReport?.daily.orEmpty()
         if (daily.isNotEmpty()) {
             item {
                 AppCard {
                     Text(
-                        text = "Daily average",
+                        text = "Daily average pulse",
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Spacer(Modifier.height(Spacing.xs))
                     Text(
-                        text = "Empty columns are days with no reading — they are not zeros.",
+                        text = "Each bar shows the average BPM for one day. Gaps mark days without readings.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -214,11 +220,11 @@ fun HealthScreen(
             }
         }
 
-        val records = report?.heartRateRecords.orEmpty()
+        val records = currentReport?.heartRateRecords.orEmpty()
         item {
             SectionHeader(
-                title = "Readings",
-                subtitle = if (records.isEmpty()) "Nothing recorded in this period" else
+                title = "Heart-rate readings",
+                subtitle = if (records.isEmpty()) "No pulse readings in this period" else
                     "${records.size} heart-rate readings"
             )
         }
@@ -228,8 +234,7 @@ fun HealthScreen(
                 EmptyState(
                     icon = Icons.Outlined.Speed,
                     title = "No data yet",
-                    message = "Connect the watch and take a measurement, or wait for the watch to " +
-                        "sync its history. Empty really means empty.",
+                    message = "Connect the watch and measure your pulse to record a reading.",
                     action = {
                         OutlinedButton(onClick = onOpenWatch) { Text("Open Watch") }
                     }
@@ -288,7 +293,6 @@ private fun MeasurementLine(label: String, state: MeasurementState) {
             else "${state.value}"
         is MeasurementState.TimedOut -> state.reason
         is MeasurementState.Failed -> state.reason
-        MeasurementState.NotSupported -> "This watch did not report a value"
     }
     KeyValueRow(label = label, value = text)
 }
@@ -323,12 +327,9 @@ private fun BloodPressureCard(report: HealthReport?, everReported: Boolean) {
         } else {
             Text(
                 text = if (everReported) {
-                    "No blood-pressure reading in this period. The watch has reported BP before, " +
-                        "but not inside this window."
+                    "No blood-pressure readings in this period."
                 } else {
-                    "No blood-pressure data has ever been received from this watch. The protocol " +
-                        "supports a BP request, but this unit has not answered it. It is shown as " +
-                        "unsupported rather than invented."
+                    "This install has received no blood-pressure readings. Support depends on the watch firmware."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant

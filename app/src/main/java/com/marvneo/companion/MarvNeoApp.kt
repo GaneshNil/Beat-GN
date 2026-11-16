@@ -5,6 +5,7 @@ import com.marvneo.companion.data.assistant.AssistantTranscriptRepository
 import com.marvneo.companion.data.ble.MarvNeoBleManager
 import com.marvneo.companion.data.db.AppDatabase
 import com.marvneo.companion.data.repository.HealthRepository
+import com.marvneo.companion.data.repository.AlarmRepository
 
 class MarvNeoApp : Application() {
 
@@ -19,12 +20,15 @@ class MarvNeoApp : Application() {
 
     lateinit var transcripts: AssistantTranscriptRepository
         private set
+    lateinit var alarms: AlarmRepository
+        private set
 
     override fun onCreate() {
         super.onCreate()
         database = AppDatabase.getDatabase(this)
         healthRepository = HealthRepository(database.healthDao())
         transcripts = AssistantTranscriptRepository(database.voiceDao())
-        bleManager = MarvNeoBleManager(this, healthRepository, database.healthDao())
+        bleManager = MarvNeoBleManager(this, healthRepository)
+        alarms = AlarmRepository(database.healthDao(), bleManager::writeAlarm)
     }
 }

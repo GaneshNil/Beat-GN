@@ -1,8 +1,11 @@
 package com.marvneo.companion.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -20,6 +23,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.marvneo.companion.ui.theme.Spacing
@@ -111,37 +118,45 @@ fun SparkBars(
 ) {
     val max = values.filterNotNull().maxOrNull() ?: 0.0
     val labelIndices = sparkLabelIndices(values.size)
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(heightDp.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.Bottom
-    ) {
-        values.forEachIndexed { index, value ->
-            val fraction = if (value == null || max <= 0.0) 0f else (value / max).toFloat()
-            Column(
-                modifier = Modifier.weight(1f),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Bottom
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(
-                            if (value == null) 0.dp
-                            else (heightDp * 0.72f * fraction).dp.coerceAtLeast(2.dp)
-                        )
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(accent.copy(alpha = 0.75f))
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    text = if (index in labelIndices) labels.getOrElse(index) { "" } else "",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1
-                )
+    if (values.isEmpty()) return
+    BoxWithConstraints(modifier.fillMaxWidth()) {
+        val minimumWidth = 44.dp * LocalDensity.current.fontScale
+        val cellWidth = maxOf(maxWidth / values.size, minimumWidth)
+        val scrolls = cellWidth * values.size > maxWidth
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.Bottom
+        ) {
+            values.forEachIndexed { index, value ->
+                val label = labels.getOrElse(index) { "" }
+                val reading = value?.let { kotlin.math.round(it).toInt() }
+                val fraction = if (value == null || max <= 0.0) 0f else (value / max).toFloat()
+                Column(
+                    modifier = Modifier.width(cellWidth).semantics {
+                        contentDescription = "$label, ${reading?.let { "$it BPM" } ?: "no reading"}"
+                    },
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(Modifier.height(heightDp.dp), contentAlignment = Alignment.BottomCenter) {
+                        if (value != null) {
+                            Box(
+                                modifier = Modifier
+                                    .width(minOf(24.dp, cellWidth - 6.dp))
+                                    .height((heightDp * fraction).dp.coerceAtLeast(2.dp))
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(accent.copy(alpha = 0.75f))
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = if (scrolls || index in labelIndices) label else "",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        modifier = Modifier.clearAndSetSemantics { }
+                    )
+                }
             }
         }
     }

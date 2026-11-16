@@ -19,6 +19,30 @@ import java.time.ZoneId
  */
 class HealthAggregatorTest {
 
+    @Test
+    fun `dedupe catches a retransmission separated by a different reading`() {
+        val records = listOf(
+            HeartRateRecord(timestamp = 1_000, bpm = 72),
+            HeartRateRecord(timestamp = 2_000, bpm = 73),
+            HeartRateRecord(timestamp = 3_000, bpm = 72),
+            HeartRateRecord(timestamp = 4_100, bpm = 72)
+        )
+        assertEquals(listOf(1_000L, 2_000L, 4_100L), HealthAggregator.validHeartRates(records).map { it.timestamp })
+    }
+
+    @Test
+    fun `yesterday cannot suppress the first reading in todays report`() {
+        val localZone = ZoneId.of("Asia/Kolkata")
+        val midnight = java.time.LocalDate.of(2026, 11, 17).atStartOfDay(localZone).toInstant().toEpochMilli()
+        val inWindow = HeartRateRecord(timestamp = midnight + 1_000, bpm = 72)
+        val report = HealthAggregator.aggregate(
+            ReportPeriod.TODAY, midnight + 60_000, localZone,
+            heartRates = listOf(HeartRateRecord(timestamp = midnight - 1_000, bpm = 72), inWindow),
+            bloodOxygen = emptyList(), bloodPressure = emptyList()
+        )
+        assertEquals(listOf(inWindow), report.heartRateRecords)
+    }
+
     private val zone: ZoneId = ZoneId.of("Asia/Kolkata")
 
     private fun at(year: Int, month: Int, day: Int, hour: Int, minute: Int = 0): Long =

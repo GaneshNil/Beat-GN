@@ -5,7 +5,6 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -59,20 +58,16 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { grants ->
-        val bluetoothDenied = grants
-            .filterKeys { it != Manifest.permission.POST_NOTIFICATIONS }
-            .any { !it.value }
-        if (!bluetoothDenied) {
-            startCompanionService()
-        } else {
-            permissionRequested = false
-        }
+    ) {
+        refreshBluetoothAccess()
     }
+
+    private var bluetoothGranted by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        permissionRequested = savedInstanceState?.getBoolean("permissionRequested") == true
 
         val app = application as MarvNeoApp
 
@@ -82,7 +77,7 @@ class MainActivity : ComponentActivity() {
                 val healthRepository = app.healthRepository
 
                 var selectedTab by rememberSaveable { mutableStateOf(0) }
-                var moreRoute by remember { mutableStateOf<String?>(null) }
+                var moreRoute by rememberSaveable { mutableStateOf<String?>(null) }
 
                 BackHandler(enabled = moreRoute != null) { moreRoute = null }
 
@@ -155,8 +150,10 @@ class MainActivity : ComponentActivity() {
 
                                 2 -> WatchScreen(
                                     bleManager = bleManager,
-                                    database = app.database,
-                                    onOpenBatterySettings = { requestIgnoreBatteryOptimization() }
+                                    alarmRepository = app.alarms,
+                                    bluetoothGranted = bluetoothGranted,
+                                    onRequestBluetoothPermissions = { requestBluetoothAccess() },
+                                    onOpenBatterySettings = { openBatterySettings() }
                                 )
 
                                 3 -> AssistantScreen(
@@ -179,16 +176,44 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        requestNeededPermissions()
+        refreshBluetoothAccess()
+        if (!permissionRequested) requestNeededPermissions()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("permissionRequested", permissionRequested)
+        super.onSaveInstanceState(outState)
+    }
+
+    private fun refreshBluetoothAccess() {
         val app = application as MarvNeoApp
+        bluetoothGranted = app.bleManager.hasPermissions()
         app.bleManager.refreshAdapterState()
-        if (app.bleManager.hasPermissions()) startCompanionService()
+        app.healthRepository.requestRefresh()
+        if (bluetoothGranted) startCompanionService()
+    }
+
+    private fun requestBluetoothAccess() {
+        val missing = missingBluetoothPermissions()
+        if (missing.isEmpty()) {
+            refreshBluetoothAccess()
+        } else if (permissionRequested && missing.none { shouldShowRequestPermissionRationale(it) }) {
+            openAppDetails()
+        } else {
+            permissionRequested = true
+            permissionLauncher.launch(missing.toTypedArray())
+        }
+    }
+
+    private fun missingBluetoothPermissions(): List<String> {
+        val app = application as MarvNeoApp
+        return app.bleManager.requiredPermissions().filter {
+            ContextCompat.checkSelfPermission(this, it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
     }
 
     private fun requestNeededPermissions() {
-        val app = application as MarvNeoApp
-        val missing = app.bleManager.requiredPermissions().toMutableList()
-
+        val missing = missingBluetoothPermissions().toMutableList()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
             android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -196,17 +221,9 @@ class MainActivity : ComponentActivity() {
             missing.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        val actuallyMissing = missing.filter {
-            ContextCompat.checkSelfPermission(this, it) !=
-                android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
-        if (actuallyMissing.isEmpty()) {
-            if (!permissionRequested) startCompanionService()
-            return
-        }
-        if (permissionRequested) return
+        if (missing.isEmpty()) return
         permissionRequested = true
-        permissionLauncher.launch(actuallyMissing.toTypedArray())
+        permissionLauncher.launch(missing.toTypedArray())
     }
 
     private fun startCompanionService() {
@@ -219,18 +236,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestIgnoreBatteryOptimization() {
-        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-        if (powerManager.isIgnoringBatteryOptimizations(packageName)) {
-            openAppDetails()
-            return
-        }
+    private fun openBatterySettings() {
         runCatching {
-            startActivity(
-                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                    data = Uri.parse("package:$packageName")
-                }
-            )
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
         }.onFailure {
             Log.w(TAG, "Could not open battery optimization settings", it)
             openAppDetails()

@@ -106,20 +106,31 @@ object CrrepaProtocol {
     }
 
     /**
-     * Strict parser: returns null unless the buffer is a complete, well-formed frame.
-     * A strict parser is what keeps the UI honest — junk is never interpreted as data.
+     * Parses the first complete frame in the buffer, ignoring any trailing bytes.
      */
     fun parse(raw: ByteArray): Frame? {
         if (raw.size < HEADER_SIZE) return null
         if ((raw[0].toInt() and 0xFF) != MAGIC_0) return null
         if ((raw[1].toInt() and 0xFF) != MAGIC_1) return null
+        val version = raw[2].toInt() and 0xFF
+        if (version != VERSION_1 && version != VERSION_2) return null
         val declaredLength = raw[3].toInt() and 0xFF
         if (declaredLength < HEADER_SIZE || declaredLength > raw.size) return null
         return Frame(
-            version = raw[2].toInt() and 0xFF,
+            version = version,
             opcode = raw[4].toInt() and 0xFF,
             payload = raw.copyOfRange(HEADER_SIZE, declaredLength)
         )
+    }
+
+    /** The current command builders all fit in one write at the default ATT MTU. */
+    internal fun forMtu(packet: ByteArray, mtu: Int): ByteArray {
+        val available = mtu.coerceAtLeast(23) - 3
+        val chunkSize = available - available % 4
+        require(packet.size <= chunkSize)
+        return packet.copyOf().apply {
+            this[2] = (if (chunkSize == 20) VERSION_1 else VERSION_2).toByte()
+        }
     }
 
     // ---------------------------------------------------------------- command builders

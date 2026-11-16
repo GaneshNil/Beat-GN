@@ -19,17 +19,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.marvneo.companion.data.ble.MarvNeoBleManager
 import com.marvneo.companion.data.repository.HealthRepository
 import com.marvneo.companion.domain.model.ConnectionState
-import com.marvneo.companion.domain.model.MeasurementState
 import com.marvneo.companion.domain.report.ReportPeriod
 import com.marvneo.companion.ui.components.AppCard
 import com.marvneo.companion.ui.components.Badge
@@ -44,7 +42,6 @@ import com.marvneo.companion.ui.theme.HeartCoral
 import com.marvneo.companion.ui.theme.MotionGreen
 import com.marvneo.companion.ui.theme.OxygenTeal
 import com.marvneo.companion.ui.theme.Spacing
-import kotlinx.coroutines.launch
 import java.util.Locale
 
 @Composable
@@ -54,19 +51,21 @@ fun HomeScreen(
     onOpenWatch: () -> Unit,
     onOpenHealth: () -> Unit
 ) {
-    val connection by bleManager.connectionState.collectAsState()
-    val today by remember { healthRepository.report(ReportPeriod.TODAY) }.collectAsState(
-        initial = null
+    val connection by bleManager.connectionState.collectAsStateWithLifecycle()
+    val today by remember { healthRepository.report(ReportPeriod.TODAY) }.collectAsStateWithLifecycle(
+        initialValue = null
     )
-    val steps by bleManager.stepsFlow.collectAsState()
-    val distance by bleManager.distanceFlow.collectAsState()
-    val battery by bleManager.batteryFlow.collectAsState()
-    val batteryKnown by bleManager.batteryKnown.collectAsState()
-    val heartRate by bleManager.heartRateFlow.collectAsState()
-    val hrMeasurement by bleManager.heartRateMeasurement.collectAsState()
-    val spo2Measurement by bleManager.spo2Measurement.collectAsState()
+    val steps by bleManager.stepsFlow.collectAsStateWithLifecycle()
+    val distance by bleManager.distanceFlow.collectAsStateWithLifecycle()
+    val calories by bleManager.caloriesFlow.collectAsStateWithLifecycle()
+    val activeMinutes by bleManager.activeMinutesFlow.collectAsStateWithLifecycle()
+    val pulseAvailable by bleManager.pulseAvailable.collectAsStateWithLifecycle()
+    val battery by bleManager.batteryFlow.collectAsStateWithLifecycle()
+    val batteryKnown by bleManager.batteryKnown.collectAsStateWithLifecycle()
+    val heartRate by bleManager.heartRateFlow.collectAsStateWithLifecycle()
+    val hrMeasurement by bleManager.heartRateMeasurement.collectAsStateWithLifecycle()
+    val spo2Measurement by bleManager.spo2Measurement.collectAsStateWithLifecycle()
 
-    val scope = rememberCoroutineScope()
     val ready = connection is ConnectionState.Ready
 
     LazyColumn(
@@ -106,10 +105,11 @@ fun HomeScreen(
                         Spacer(Modifier.width(6.dp))
                         Text("Watch")
                     }
-                    if (ready) {
-                        OutlinedButton(onClick = {
-                            scope.launch { bleManager.startHeartRateMeasurement() }
-                        }) {
+                    if (ready && pulseAvailable) {
+                        OutlinedButton(
+                            enabled = !hrMeasurement.active,
+                            onClick = bleManager::startHeartRateMeasurement
+                        ) {
                             Icon(Icons.Outlined.FavoriteBorder, contentDescription = null)
                             Spacer(Modifier.width(6.dp))
                             Text("Measure pulse")
@@ -119,7 +119,7 @@ fun HomeScreen(
             }
         }
 
-        if (hrMeasurement is MeasurementState.InProgress || spo2Measurement is MeasurementState.InProgress) {
+        if (hrMeasurement.active || spo2Measurement.active) {
             item {
                 InlineNotice(
                     title = "Measurement running",
@@ -159,13 +159,12 @@ fun HomeScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(Spacing.md)) {
                 MetricTile(
                     title = "Steps",
-                    value = if (steps > 0) steps.toString() else "—",
-                    unit = if (steps > 0) "steps" else null,
-                    caption = if (steps > 0) {
-                        String.format(Locale.getDefault(), "%.2f km", distance / 1000.0)
-                    } else {
-                        "Watch has not reported"
-                    },
+                    value = steps?.toString() ?: "—",
+                    caption = listOfNotNull(
+                        distance?.let { String.format(Locale.getDefault(), "%.2f km", it / 1000.0) },
+                        calories?.let { "$it cal" },
+                        activeMinutes?.let { "$it active min" }
+                    ).joinToString("\n").ifEmpty { if (steps == null) "Waiting for watch data" else "" },
                     accent = MotionGreen,
                     modifier = Modifier.weight(1f)
                 )

@@ -28,9 +28,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -43,7 +42,6 @@ import com.marvneo.companion.ui.components.KeyValueRow
 import com.marvneo.companion.ui.components.SectionHeader
 import com.marvneo.companion.ui.components.connectionLabel
 import com.marvneo.companion.ui.theme.Spacing
-import kotlinx.coroutines.launch
 
 @Composable
 fun MoreScreen(
@@ -82,7 +80,7 @@ private fun MoreMenu(onNavigate: (String?) -> Unit) {
                 MenuRow(
                     icon = Icons.Outlined.Watch,
                     title = "Device information",
-                    subtitle = "Address, firmware, MTU, supported services"
+                    subtitle = "Model, firmware and link details"
                 ) { onNavigate("device") }
                 HorizontalDivider(
                     modifier = Modifier.padding(vertical = Spacing.sm),
@@ -91,7 +89,7 @@ private fun MoreMenu(onNavigate: (String?) -> Unit) {
                 MenuRow(
                     icon = Icons.Outlined.BugReport,
                     title = "Diagnostics",
-                    subtitle = "Every Bluetooth exchange this session"
+                    subtitle = "Connection events and Bluetooth status"
                 ) { onNavigate("diagnostics") }
                 HorizontalDivider(
                     modifier = Modifier.padding(vertical = Spacing.sm),
@@ -155,14 +153,14 @@ private fun PageHeader(title: String, onBack: () -> Unit) {
 
 @Composable
 private fun DeviceInfoPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
-    val connection by bleManager.connectionState.collectAsState()
-    val address by bleManager.connectedDeviceAddress.collectAsState()
-    val name by bleManager.connectedDeviceName.collectAsState()
-    val firmware by bleManager.firmwareVersion.collectAsState()
-    val model by bleManager.modelNumber.collectAsState()
-    val manufacturer by bleManager.manufacturerName.collectAsState()
-    val mtu by bleManager.negotiatedMtu.collectAsState()
-    val lastSeen by bleManager.lastCommunicationTimestamp.collectAsState()
+    val connection by bleManager.connectionState.collectAsStateWithLifecycle()
+    val address by bleManager.connectedDeviceAddress.collectAsStateWithLifecycle()
+    val name by bleManager.connectedDeviceName.collectAsStateWithLifecycle()
+    val firmware by bleManager.firmwareVersion.collectAsStateWithLifecycle()
+    val model by bleManager.modelNumber.collectAsStateWithLifecycle()
+    val manufacturer by bleManager.manufacturerName.collectAsStateWithLifecycle()
+    val mtu by bleManager.negotiatedMtu.collectAsStateWithLifecycle()
+    val lastSeen by bleManager.lastCommunicationTimestamp.collectAsStateWithLifecycle()
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -174,7 +172,7 @@ private fun DeviceInfoPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
             AppCard {
                 KeyValueRow("State", connectionLabel(connection))
                 KeyValueRow("Name", name ?: "—")
-                KeyValueRow("Address", address ?: "—")
+                KeyValueRow("Address suffix", address?.takeLast(5) ?: "—")
                 KeyValueRow("Manufacturer", manufacturer ?: "not reported")
                 KeyValueRow("Model", model ?: "not reported")
                 KeyValueRow("Firmware", firmware ?: "not reported")
@@ -208,8 +206,7 @@ private fun DeviceInfoPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
 
 @Composable
 private fun DiagnosticsPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
-    val entries by bleManager.diagnostics.collectAsState()
-    val scope = rememberCoroutineScope()
+    val entries by bleManager.diagnostics.collectAsStateWithLifecycle()
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -219,8 +216,7 @@ private fun DiagnosticsPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
         item { PageHeader("Diagnostics", onBack) }
         item {
             Text(
-                "Raw Bluetooth activity for this session. Useful when reporting a bug: these are " +
-                    "the exact bytes that were sent and received.",
+                "Recent connection events, command opcodes, packet sizes and callback results.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -277,11 +273,11 @@ private fun SoftwarePage(onBack: () -> Unit) {
         }
         item {
             AppCard {
-                Text("Leaves the phone", style = MaterialTheme.typography.titleMedium)
+                Text("Bluetooth and internet", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(Spacing.xs))
                 Text(
-                    "Nothing. There is no analytics, no crash reporting, no login and no cloud " +
-                        "service. The app requests no internet permission.",
+                    "The app sends time, alarm settings and control requests over Bluetooth. " +
+                        "It uses local storage and requests no internet access.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -325,8 +321,7 @@ private fun AboutPage(onBack: () -> Unit) {
                 Text("Known limitations", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(Spacing.xs))
                 Text(
-                    "• Alarms are written to the watch but cannot be read back or acknowledged by " +
-                        "this firmware, so they stay marked pending.\n" +
+                    "• Verify sent alarms on the watch. This app tracks the Bluetooth write result.\n" +
                         "• Find-watch has no protocol-level confirmation.\n" +
                         "• Blood pressure is shown only when the watch sends a reading.\n" +
                         "• Watch faces, app installation and firmware updates are not implemented.",

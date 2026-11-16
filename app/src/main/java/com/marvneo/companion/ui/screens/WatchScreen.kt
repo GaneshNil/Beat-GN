@@ -1,6 +1,7 @@
 package com.marvneo.companion.ui.screens
 
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -35,11 +36,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -47,7 +47,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.marvneo.companion.data.ble.MarvNeoBleManager
 import com.marvneo.companion.data.ble.protocol.CrrepaProtocol
-import com.marvneo.companion.data.db.AppDatabase
+import com.marvneo.companion.data.repository.AlarmRepository
 import com.marvneo.companion.data.db.entity.AlarmRecord
 import com.marvneo.companion.data.db.entity.AlarmSyncState
 import com.marvneo.companion.domain.model.AlarmSlots
@@ -64,28 +64,38 @@ import com.marvneo.companion.ui.components.connectionColor
 import com.marvneo.companion.ui.components.connectionDetail
 import com.marvneo.companion.ui.components.connectionLabel
 import com.marvneo.companion.ui.theme.Spacing
-import kotlinx.coroutines.launch
 
 @Composable
 fun WatchScreen(
     bleManager: MarvNeoBleManager,
-    database: AppDatabase,
+    alarmRepository: AlarmRepository,
+    bluetoothGranted: Boolean,
+    onRequestBluetoothPermissions: () -> Unit,
     onOpenBatterySettings: () -> Unit
 ) {
-    val connection by bleManager.connectionState.collectAsState()
-    val devices by bleManager.discoveredDevices.collectAsState()
-    val scanning by bleManager.isScanning.collectAsState()
-    val findOutcome by bleManager.findWatchOutcome.collectAsState()
-    val alarms by database.healthDao().getAllAlarms().collectAsState(initial = emptyList())
-    val battery by bleManager.batteryFlow.collectAsState()
-    val batteryKnown by bleManager.batteryKnown.collectAsState()
-    val mtu by bleManager.negotiatedMtu.collectAsState()
-    val firmware by bleManager.firmwareVersion.collectAsState()
+    val connection by bleManager.connectionState.collectAsStateWithLifecycle()
+    val devices by bleManager.discoveredDevices.collectAsStateWithLifecycle()
+    val scanning by bleManager.isScanning.collectAsStateWithLifecycle()
+    val findOutcome by bleManager.findWatchOutcome.collectAsStateWithLifecycle()
+    val alarms by alarmRepository.alarms.collectAsStateWithLifecycle(initialValue = null)
+    val alarmBusy by alarmRepository.busy.collectAsStateWithLifecycle()
+    val alarmError by alarmRepository.error.collectAsStateWithLifecycle()
+    val batteryMessage by bleManager.batteryReadMessage.collectAsStateWithLifecycle()
+    val bluetoothOn by bleManager.bluetoothEnabled.collectAsStateWithLifecycle()
+    val address by bleManager.connectedDeviceAddress.collectAsStateWithLifecycle()
+    val battery by bleManager.batteryFlow.collectAsStateWithLifecycle()
+    val batteryKnown by bleManager.batteryKnown.collectAsStateWithLifecycle()
+    val mtu by bleManager.negotiatedMtu.collectAsStateWithLifecycle()
+    val firmware by bleManager.firmwareVersion.collectAsStateWithLifecycle()
 
-    val scope = rememberCoroutineScope()
     val ready = connection is ConnectionState.Ready
-    var editorSlot by remember { mutableStateOf<AlarmRecord?>(null) }
-    val freeAlarmSlot = AlarmSlots.firstFree(alarms.map { it.id })
+    var editSlot by rememberSaveable { mutableStateOf<Int?>(null) }
+    var addingAlarm by rememberSaveable { mutableStateOf(false) }
+    var deleteSlot by rememberSaveable { mutableStateOf<Int?>(null) }
+    val freeAlarmSlot = alarms?.let { rows -> AlarmSlots.firstFree(rows.map { it.id }) }
+    val editorSlot = if (addingAlarm) freeAlarmSlot?.let(::emptyAlarm)
+        else alarms?.firstOrNull { it.id == editSlot }
+    val linkActive = address != null || connection is ConnectionState.Reconnecting
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -113,26 +123,33 @@ fun WatchScreen(
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Spacer(Modifier.height(Spacing.md))
-                Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.sm)
+                ) {
                     when {
-                        ready -> OutlinedButton(onClick = { bleManager.disconnect() }) {
+                        !bluetoothGranted -> Button(onClick = onRequestBluetoothPermissions) {
+                            Text("Grant Bluetooth access")
+                        }
+
+                        linkActive -> OutlinedButton(onClick = { bleManager.disconnect() }) {
                             Icon(Icons.Outlined.Close, contentDescription = null)
                             Spacer(Modifier.width(6.dp))
-                            Text("Disconnect")
+                            Text(if (ready || connection is ConnectionState.Unstable) "Disconnect" else "Cancel connection")
                         }
 
                         scanning -> OutlinedButton(onClick = { bleManager.stopScan() }) {
                             Text("Stop scan")
                         }
 
-                        else -> Button(onClick = { bleManager.startScan() }) {
+                        else -> Button(enabled = bluetoothOn, onClick = { bleManager.startScan() }) {
                             Icon(Icons.Outlined.Search, contentDescription = null)
                             Spacer(Modifier.width(6.dp))
                             Text("Scan")
                         }
                     }
                     OutlinedButton(
-                        enabled = bleManager.lastKnownAddress() != null,
+                        enabled = bluetoothGranted && bluetoothOn && !linkActive && !scanning && bleManager.canReconnect(),
                         onClick = { bleManager.reconnect() }
                     ) {
                         Icon(Icons.Outlined.Refresh, contentDescription = null)
@@ -147,10 +164,10 @@ fun WatchScreen(
             item {
                 SectionHeader(
                     title = "Nearby",
-                    subtitle = "Showing every named device the phone can see"
+                    subtitle = "Select your watch from nearby Bluetooth devices"
                 )
             }
-            items(devices) { device ->
+            items(devices, key = { it.address }) { device ->
                 AppCard(onClick = { bleManager.connect(device.address) }) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -165,7 +182,7 @@ fun WatchScreen(
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
-                                text = "${device.address} · ${device.rssi} dBm",
+                                text = "…${device.address.takeLast(5)} · ${device.rssi} dBm",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -200,15 +217,14 @@ fun WatchScreen(
                 }
                 Spacer(Modifier.height(Spacing.xs))
                 Text(
-                    text = "Makes the watch vibrate. The vendor protocol defines no reply for this " +
-                        "command, so the app reports it as sent — never as confirmed.",
+                    text = "Requests a vibration. Check the watch for the result.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(Modifier.height(Spacing.md))
                 Button(
                     enabled = ready && findOutcome !is CommandOutcome.Sending,
-                    onClick = { scope.launch { bleManager.findWatch() } }
+                    onClick = { bleManager.findWatch() }
                 ) {
                     Text("Vibrate watch")
                 }
@@ -224,11 +240,11 @@ fun WatchScreen(
         item {
             SectionHeader(
                 title = "Alarms",
-                subtitle = "Five slots, written to the watch; confirmation is not available",
+                subtitle = "Five slots with local storage and Bluetooth writes",
                 trailing = {
                     IconButton(
-                        enabled = freeAlarmSlot != null,
-                        onClick = { freeAlarmSlot?.let { editorSlot = emptyAlarm(it) } }
+                        enabled = freeAlarmSlot != null && !alarmBusy,
+                        onClick = { addingAlarm = true }
                     ) {
                         Icon(Icons.Outlined.Add, contentDescription = "Add alarm")
                     }
@@ -238,70 +254,46 @@ fun WatchScreen(
 
         item {
             InlineNotice(
-                title = "About alarm confirmation",
-                message = "Writes are sent to the watch and the Bluetooth write is confirmed. The " +
-                    "watch's firmware does not acknowledge an alarm write, so every alarm stays " +
-                    "marked \"pending confirmation\" until a firmware-level read-back exists.",
+                title = "Check alarms on the watch",
+                message = "Sent means the Bluetooth write completed. Check the slot and schedule on the watch.",
                 tone = NoticeTone.INFO
             )
         }
-
-        item {
-            InlineNotice(
-                title = "Deleting is phone-only",
-                message = "Deleting an alarm removes it from this phone. This build sends no " +
-                    "delete command, so an alarm already written to the watch may keep alerting " +
-                    "there. Disable it here and send, or remove it on the watch itself.",
-                tone = NoticeTone.WARNING
-            )
+        alarmError?.let { message ->
+            item { InlineNotice(title = "Alarm update failed", message = message, tone = NoticeTone.WARNING) }
         }
 
-        if (freeAlarmSlot == null) {
-            item {
-                InlineNotice(
-                    title = "All five slots are in use",
-                    message = "The watch supports five alarm slots. Delete an alarm on this phone " +
-                        "before adding another.",
-                    tone = NoticeTone.WARNING
-                )
-            }
-        }
-
-        if (alarms.isEmpty()) {
-            item {
+        val currentAlarms = alarms
+        when {
+            currentAlarms == null -> item { Text("Loading alarms…") }
+            currentAlarms.isEmpty() -> item {
                 EmptyState(
                     icon = Icons.Outlined.Alarm,
                     title = "No alarms configured",
-                    message = "Create one and it will be written to the watch when it is connected."
+                    message = "Save an alarm on this phone. Send it from this screen when the watch is connected."
                 )
             }
-        } else {
-            items(alarms) { alarm ->
-                AlarmCard(
-                    alarm = alarm,
-                    onEdit = { editorSlot = alarm },
-                    onDelete = {
-                        scope.launch { database.healthDao().deleteAlarm(alarm.id) }
-                    },
-                    onSend = {
-                        scope.launch {
-                            database.healthDao().updateAlarmSyncState(
-                                alarm.id,
-                                AlarmSyncState.PENDING,
-                                System.currentTimeMillis()
-                            )
-                            val outcome = bleManager.writeAlarm(alarm)
-                            if (outcome is CommandOutcome.Failed) {
-                                database.healthDao().updateAlarmSyncState(
-                                    alarm.id,
-                                    AlarmSyncState.FAILED,
-                                    System.currentTimeMillis()
-                                )
-                            }
-                        }
-                    },
-                    canSend = ready
-                )
+            else -> {
+                if (freeAlarmSlot == null) {
+                    item {
+                        InlineNotice(
+                            title = "All five phone slots are in use",
+                            message = "Delete a phone alarm to free a slot.",
+                            tone = NoticeTone.WARNING
+                        )
+                    }
+                }
+                items(currentAlarms, key = { it.id }) { alarm ->
+                    AlarmCard(
+                        alarm = alarm,
+                        onEdit = { editSlot = alarm.id },
+                        onDelete = { deleteSlot = alarm.id },
+                        onSend = { alarmRepository.send(alarm.id) },
+                        enabled = !alarmBusy,
+                        canSend = ready &&
+                            AlarmSlots.isValid(alarm.id, alarm.hour, alarm.minute, alarm.repeatDays, alarm.isEnabled)
+                    )
+                }
             }
         }
 
@@ -320,13 +312,17 @@ fun WatchScreen(
                 )
                 KeyValueRow("MTU", if (mtu > 0) "$mtu" else "not negotiated")
                 KeyValueRow("Firmware", firmware ?: "not reported")
-                KeyValueRow("Address", bleManager.connectedDeviceAddress.collectAsState().value ?: "—")
+                KeyValueRow("Address suffix", address?.takeLast(5) ?: "—")
                 Spacer(Modifier.height(Spacing.md))
-                OutlinedButton(onClick = { scope.launch { bleManager.readBattery() } }) {
+                OutlinedButton(
+                    enabled = (ready || connection is ConnectionState.Unstable) && batteryMessage != "Reading battery…",
+                    onClick = { bleManager.readBattery() }
+                ) {
                     Icon(Icons.Outlined.BatteryFull, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
                     Text("Read battery")
                 }
+                batteryMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
             }
         }
 
@@ -340,27 +336,29 @@ fun WatchScreen(
     editorSlot?.let { alarm ->
         AlarmEditorDialog(
             initial = alarm,
-            onDismiss = { editorSlot = null },
+            onDismiss = {
+                editSlot = null
+                addingAlarm = false
+            },
             onSave = { updated ->
-                editorSlot = null
-                scope.launch {
-                    val record = updated.copy(
-                        syncState = AlarmSyncState.PENDING,
-                        updatedAt = System.currentTimeMillis()
-                    )
-                    database.healthDao().upsertAlarm(record)
-                    if (bleManager.connectionState.value is ConnectionState.Ready) {
-                        val outcome = bleManager.writeAlarm(record)
-                        if (outcome is CommandOutcome.Failed) {
-                            database.healthDao().updateAlarmSyncState(
-                                record.id,
-                                AlarmSyncState.FAILED,
-                                System.currentTimeMillis()
-                            )
-                        }
-                    }
-                }
+                alarmRepository.save(updated, addingAlarm, sendWhenReady = ready)
+                editSlot = null
+                addingAlarm = false
             }
+        )
+    }
+    deleteSlot?.let { slot ->
+        AlertDialog(
+            onDismissRequest = { deleteSlot = null },
+            title = { Text("Delete phone alarm?") },
+            text = { Text("A matching watch alarm can still ring. Disable it first and check the watch if you want to stop it.") },
+            confirmButton = {
+                TextButton(enabled = !alarmBusy, onClick = {
+                    alarmRepository.delete(slot)
+                    deleteSlot = null
+                }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { deleteSlot = null }) { Text("Cancel") } }
         )
     }
 }
@@ -371,6 +369,7 @@ private fun AlarmCard(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onSend: () -> Unit,
+    enabled: Boolean,
     canSend: Boolean
 ) {
     AppCard {
@@ -392,23 +391,25 @@ private fun AlarmCard(
             }
             Badge(
                 text = when (alarm.syncState) {
-                    AlarmSyncState.SYNCED -> "synced"
+                    AlarmSyncState.SENT, AlarmSyncState.SYNCED -> "sent · check watch"
                     AlarmSyncState.FAILED -> "failed"
                     else -> "pending"
                 },
                 color = when (alarm.syncState) {
-                    AlarmSyncState.SYNCED -> com.marvneo.companion.ui.theme.StatusPositive
                     AlarmSyncState.FAILED -> com.marvneo.companion.ui.theme.StatusCritical
                     else -> com.marvneo.companion.ui.theme.StatusWarning
                 }
             )
         }
         Spacer(Modifier.height(Spacing.sm))
-        Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-            TextButton(onClick = onEdit) { Text("Edit") }
-            TextButton(onClick = onSend, enabled = canSend) { Text("Send to watch") }
-            TextButton(onClick = onDelete) {
-                Icon(Icons.Outlined.DeleteOutline, contentDescription = null)
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(Spacing.sm)
+        ) {
+            TextButton(onClick = onEdit, enabled = enabled) { Text("Edit") }
+            TextButton(onClick = onSend, enabled = enabled && canSend) { Text("Send to watch") }
+            TextButton(onClick = onDelete, enabled = enabled) {
+                Icon(Icons.Outlined.DeleteOutline, contentDescription = "Delete phone alarm")
             }
         }
     }
@@ -420,28 +421,32 @@ private fun AlarmEditorDialog(
     onDismiss: () -> Unit,
     onSave: (AlarmRecord) -> Unit
 ) {
-    var hour by remember { mutableStateOf(initial.hour.toString()) }
-    var minute by remember { mutableStateOf(initial.minute.toString()) }
-    var mask by remember { mutableStateOf(initial.repeatDays) }
-    var enabled by remember { mutableStateOf(initial.isEnabled) }
+    var hour by rememberSaveable(initial.id) { mutableStateOf(initial.hour.toString()) }
+    var minute by rememberSaveable(initial.id) { mutableStateOf(initial.minute.toString()) }
+    var mask by rememberSaveable(initial.id) { mutableStateOf(initial.repeatDays) }
+    var enabled by rememberSaveable(initial.id) { mutableStateOf(initial.isEnabled) }
 
+    val validHour = hour.toIntOrNull()?.takeIf { it in 0..23 }
+    val validMinute = minute.toIntOrNull()?.takeIf { it in 0..59 }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Alarm ${initial.id + 1}") },
         text = {
-            Column {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
                     OutlinedTextField(
                         value = hour,
                         onValueChange = { hour = it.filter(Char::isDigit).take(2) },
-                        label = { Text("Hour") },
+                        label = { Text("Hour (0–23)") },
+                        isError = validHour == null,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier.weight(1f)
                     )
                     OutlinedTextField(
                         value = minute,
                         onValueChange = { minute = it.filter(Char::isDigit).take(2) },
-                        label = { Text("Minute") },
+                        label = { Text("Minute (0–59)") },
+                        isError = validMinute == null,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier.weight(1f)
                     )
@@ -453,19 +458,18 @@ private fun AlarmEditorDialog(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    DayChip("S", mask, CrrepaProtocol.REPEAT_SUNDAY) { mask = mask xor it }
-                    DayChip("M", mask, CrrepaProtocol.REPEAT_MONDAY) { mask = mask xor it }
-                    DayChip("T", mask, CrrepaProtocol.REPEAT_TUESDAY) { mask = mask xor it }
-                    DayChip("W", mask, CrrepaProtocol.REPEAT_WEDNESDAY) { mask = mask xor it }
-                    DayChip("T", mask, CrrepaProtocol.REPEAT_THURSDAY) { mask = mask xor it }
-                    DayChip("F", mask, CrrepaProtocol.REPEAT_FRIDAY) { mask = mask xor it }
-                    DayChip("S", mask, CrrepaProtocol.REPEAT_SATURDAY) { mask = mask xor it }
+                    DayChip("Sun", mask, CrrepaProtocol.REPEAT_SUNDAY) { mask = mask xor it }
+                    DayChip("Mon", mask, CrrepaProtocol.REPEAT_MONDAY) { mask = mask xor it }
+                    DayChip("Tue", mask, CrrepaProtocol.REPEAT_TUESDAY) { mask = mask xor it }
+                    DayChip("Wed", mask, CrrepaProtocol.REPEAT_WEDNESDAY) { mask = mask xor it }
+                    DayChip("Thu", mask, CrrepaProtocol.REPEAT_THURSDAY) { mask = mask xor it }
+                    DayChip("Fri", mask, CrrepaProtocol.REPEAT_FRIDAY) { mask = mask xor it }
+                    DayChip("Sat", mask, CrrepaProtocol.REPEAT_SATURDAY) { mask = mask xor it }
                 }
-                if (mask == 0) {
+                if (enabled && mask == 0) {
                     Spacer(Modifier.height(Spacing.xs))
                     Text(
-                        "No days selected. This build cannot send a dated one-off alarm, so this " +
-                            "alarm may never fire.",
+                        "Select at least one repeat day or disable the alarm.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -479,10 +483,10 @@ private fun AlarmEditorDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                val h = hour.toIntOrNull()?.coerceIn(0, 23) ?: initial.hour
-                val m = minute.toIntOrNull()?.coerceIn(0, 59) ?: initial.minute
+                val h = validHour ?: return@TextButton
+                val m = validMinute ?: return@TextButton
                 onSave(initial.copy(hour = h, minute = m, repeatDays = mask, isEnabled = enabled))
-            }) { Text("Save") }
+            }, enabled = validHour != null && validMinute != null && (!enabled || mask != 0)) { Text("Save") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel") }
@@ -514,7 +518,7 @@ private fun emptyAlarm(slot: Int): AlarmRecord {
 
 private fun repeatLabel(mask: Int): String = when (mask) {
     CrrepaProtocol.REPEAT_EVERY_DAY -> "Every day"
-    0 -> "No days selected (may never fire)"
+    0 -> "No repeat days"
     else -> {
         val days = listOf(
             "Sun" to CrrepaProtocol.REPEAT_SUNDAY,
@@ -533,8 +537,7 @@ private fun describeOutcome(outcome: CommandOutcome): String = when (outcome) {
     CommandOutcome.Idle -> "Not sent yet."
     CommandOutcome.Sending -> "Sending…"
     is CommandOutcome.AwaitingAcknowledgement ->
-        "Sent to the watch. The watch did not acknowledge, and this protocol has no confirmation " +
-            "message — so this is not reported as success."
+        "Bluetooth write completed. Check the watch for vibration."
     is CommandOutcome.Acknowledged -> "The watch confirmed the command."
     is CommandOutcome.Failed -> "Could not send: ${outcome.reason}"
 }
