@@ -2,22 +2,27 @@ package com.marvneo.companion.data.repository
 
 import com.marvneo.companion.data.db.dao.HealthDao
 import com.marvneo.companion.data.db.entity.AlarmRecord
+import com.marvneo.companion.data.db.entity.AlarmSyncState
 import com.marvneo.companion.data.db.entity.BloodOxygenRecord
 import com.marvneo.companion.data.db.entity.BloodPressureRecord
 import com.marvneo.companion.data.db.entity.HeartRateRecord
 import com.marvneo.companion.data.db.entity.SleepRecord
 import com.marvneo.companion.data.db.entity.StepRecord
+import com.marvneo.companion.domain.model.CommandOutcome
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.ZoneId
+import java.time.LocalDate
 
 class HealthRepositoryTest {
 
@@ -120,6 +125,82 @@ class HealthRepositoryTest {
         assertNotNull(dao.heartRates.single())
     }
 
+    @Test
+    fun `simultaneous copies of a reading are stored once`() = runBlocking {
+        val dao = FakeHealthDao()
+        val repo = repository(dao)
+        val first = async { repo.recordBloodOxygen(96) }
+        val second = async { repo.recordBloodOxygen(96) }
+
+        assertEquals(setOf(HealthRepository.WriteResult.STORED, HealthRepository.WriteResult.DUPLICATE),
+            setOf(first.await(), second.await()))
+        assertEquals(1, dao.bloodOxygen.size)
+    }
+
+    @Test
+    fun `steps preserve changed fields and midnight even when the count is identical`() = runBlocking {
+        val dao = FakeHealthDao()
+        val midnight = LocalDate.of(2026, 11, 17).atStartOfDay(zone).toInstant().toEpochMilli()
+        val repo = repository(dao)
+        repo.recordSteps(0, 0, 0, midnight - 3_000)
+        repo.recordSteps(0, 0, 0, midnight - 2_000)
+        repo.recordSteps(0, 0, 1, midnight - 1_000)
+        repository(dao).recordSteps(0, 0, 1, midnight)
+        repository(dao).recordSteps(0, 0, 1, midnight + 1)
+        assertEquals(listOf(midnight - 3_000, midnight - 1_000, midnight), dao.stepRows.map { it.timestamp })
+    }
+
+    @Test
+    fun `recording the same pulse just after local midnight keeps the first reading of the day`() = runBlocking {
+        val dao = FakeHealthDao()
+        val midnight = LocalDate.of(2026, 11, 17).atStartOfDay(zone).toInstant().toEpochMilli()
+        val repo = repository(dao)
+        repo.recordHeartRate(72, midnight - 1_000)
+        assertEquals(HealthRepository.WriteResult.STORED, repo.recordHeartRate(72, midnight + 1_000))
+        assertEquals(2, dao.heartRates.size)
+    }
+
+    @Test
+    fun `saving offline and sending later uses the latest alarm and records transport only`() = runBlocking {
+        val dao = FakeHealthDao()
+        val writes = mutableListOf<AlarmRecord>()
+        val repo = AlarmRepository(dao, { calls ->
+            writes += calls
+            CommandOutcome.AwaitingAcknowledgement()
+        }, scope = this)
+        val alarm = AlarmRecord(4, 7, 30, 127, true, "Alarm")
+        repo.save(alarm, newSlot = true, sendWhenReady = false)
+        repo.busy.first { !it }
+        assertTrue(writes.isEmpty())
+        assertEquals(0, dao.alarms.single().id)
+        assertEquals(AlarmSyncState.PENDING, dao.alarms.single().syncState)
+
+        repo.save(dao.alarms.single().copy(hour = 8), newSlot = false, sendWhenReady = false)
+        repo.busy.first { !it }
+        repo.send(0)
+        repo.busy.first { !it }
+        assertEquals(8, writes.single().hour)
+        assertEquals(AlarmSyncState.SENT, dao.alarms.single().syncState)
+    }
+
+    @Test
+    fun `failed alarm send is retained and an enabled alarm needs at least one repeat day`() = runBlocking {
+        val dao = FakeHealthDao()
+        val repo = AlarmRepository(dao, { CommandOutcome.Failed("Watch is not ready") }, scope = this)
+        val alarm = AlarmRecord(0, 8, 0, 0, true, "Alarm")
+        repo.save(alarm, newSlot = true, sendWhenReady = true)
+        repo.busy.first { !it }
+        assertTrue(dao.alarms.isEmpty())
+
+        repo.save(alarm.copy(repeatDays = 127), newSlot = true, sendWhenReady = true)
+        repo.busy.first { !it }
+        assertEquals(AlarmSyncState.FAILED, dao.alarms.single().syncState)
+        assertEquals("Watch is not ready", repo.error.value)
+        repo.delete(0)
+        repo.busy.first { !it }
+        assertTrue(dao.alarms.isEmpty())
+    }
+
     /** Minimal in-memory DAO. Only the paths used by [HealthRepository] do real work. */
     private class FakeHealthDao : HealthDao {
 
@@ -127,10 +208,14 @@ class HealthRepositoryTest {
         val bloodOxygen = mutableListOf<BloodOxygenRecord>()
         val bloodPressure = mutableListOf<BloodPressureRecord>()
         val alarms = mutableListOf<AlarmRecord>()
+        val stepRows = mutableListOf<StepRecord>()
         private val everBloodPressure = MutableStateFlow(false)
 
-        override suspend fun insertStep(record: StepRecord): Long = 0L
-        override fun getLatestSteps(): Flow<StepRecord?> = flowOf(null)
+        override suspend fun insertStep(record: StepRecord): Long {
+            stepRows.add(record)
+            return record.id
+        }
+        override fun getLatestSteps(): Flow<StepRecord?> = flowOf(stepRows.maxByOrNull { it.timestamp })
         override fun getStepsBetween(start: Long, end: Long): Flow<List<StepRecord>> = flowOf(emptyList())
 
         override suspend fun insertHeartRate(record: HeartRateRecord): Long {
@@ -146,6 +231,7 @@ class HealthRepositoryTest {
             heartRates.count { it.bpm == bpm && it.timestamp in from..to }
 
         override suspend fun insertBloodOxygen(record: BloodOxygenRecord): Long {
+            yield()
             bloodOxygen.add(record)
             return record.id
         }

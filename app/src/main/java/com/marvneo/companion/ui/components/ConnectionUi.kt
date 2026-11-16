@@ -36,7 +36,7 @@ fun connectionDetail(state: ConnectionState): String = when (state) {
     is ConnectionState.DiscoveringServices ->
         "Reading the watch's GATT profile."
     is ConnectionState.Connecting -> "Opening a GATT link to ${state.name}."
-    is ConnectionState.Scanning -> "Looking for nearby watches. This stops when the watch answers."
+    is ConnectionState.Scanning -> "Looking for nearby Bluetooth devices."
     is ConnectionState.WatchFound -> "${state.name} answered at ${state.rssi} dBm."
     is ConnectionState.Reconnecting ->
         "Reconnect attempt ${state.attempt} of ${state.maxAttempts}."

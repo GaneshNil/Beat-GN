@@ -113,9 +113,9 @@ object HealthAggregator {
     ): HealthReport {
         val window = ReportWindows.of(period, nowMillis, zone)
 
-        val hr = validHeartRates(heartRates).filter { it.timestamp in window.startMillis..window.endMillis }
-        val spo2 = validBloodOxygen(bloodOxygen).filter { it.timestamp in window.startMillis..window.endMillis }
-        val bp = validBloodPressure(bloodPressure).filter { it.timestamp in window.startMillis..window.endMillis }
+        val hr = recordsByDay(heartRates, window, zone, HeartRateRecord::timestamp).flatMap(::validHeartRates)
+        val spo2 = recordsByDay(bloodOxygen, window, zone, BloodOxygenRecord::timestamp).flatMap(::validBloodOxygen)
+        val bp = recordsByDay(bloodPressure, window, zone, BloodPressureRecord::timestamp).flatMap(::validBloodPressure)
 
         return HealthReport(
             period = period,
@@ -131,6 +131,16 @@ object HealthAggregator {
         )
     }
 
+    private fun <T> recordsByDay(
+        records: List<T>,
+        window: PeriodWindow,
+        zone: ZoneId,
+        timestamp: (T) -> Long
+    ): Collection<List<T>> = records
+        .filter { timestamp(it) in window.startMillis..window.endMillis }
+        .groupBy { Instant.ofEpochMilli(timestamp(it)).atZone(zone).toLocalDate() }
+        .values
+
     fun validHeartRates(records: List<HeartRateRecord>): List<HeartRateRecord> =
         dedupe(records.sortedBy { it.timestamp }, { it.timestamp }, { it.bpm })
             .filter { it.bpm in 25..250 }
@@ -140,7 +150,7 @@ object HealthAggregator {
             .filter { it.percentage in 50..100 }
 
     fun validBloodPressure(records: List<BloodPressureRecord>): List<BloodPressureRecord> =
-        dedupe(records.sortedBy { it.timestamp }, { it.timestamp }, { "${it.systolic}/${it.diastolic}" })
+        dedupe(records.sortedBy { it.timestamp }, { it.timestamp }, { it.systolic to it.diastolic })
             .filter {
                 it.systolic in 60..255 && it.diastolic in 30..160 && it.systolic > it.diastolic
             }
@@ -196,18 +206,21 @@ object HealthAggregator {
      * Drops repeated values that arrive within [DEDUPE_WINDOW_MS] of each other, which is what
      * happens when a watch re-sends the same notification or a retry delivers twice.
      */
-    private fun <T> dedupe(
+    private fun <T, Key> dedupe(
         sorted: List<T>,
         timestamp: (T) -> Long,
-        value: (T) -> Any
+        value: (T) -> Key
     ): List<T> {
         val out = ArrayList<T>(sorted.size)
+        val lastByValue = mutableMapOf<Key, Long>()
         for (item in sorted) {
-            val previous = out.lastOrNull()
-            val duplicate = previous != null &&
-                value(previous) == value(item) &&
-                timestamp(item) - timestamp(previous) <= DEDUPE_WINDOW_MS
-            if (!duplicate) out.add(item)
+            val key = value(item)
+            val at = timestamp(item)
+            val previous = lastByValue[key]
+            if (previous == null || at - previous > DEDUPE_WINDOW_MS) {
+                out.add(item)
+                lastByValue[key] = at
+            }
         }
         return out
     }

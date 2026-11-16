@@ -14,13 +14,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.RecordVoiceOver
 import androidx.compose.material3.Icon
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -41,13 +46,13 @@ import java.util.Locale
  * Transcript view.
  *
  * This screen deliberately has no API key, no text generation, no microphone capture and no
- * notification scraping. It only lists messages that arrived over the watch link. If nothing has
- * arrived, it says so and explains why.
+ * notification scraping. Rows carried forward from earlier builds are labelled as legacy entries.
  */
 @Composable
 fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
-    val messages by transcripts.messages.collectAsState(initial = emptyList())
+    val messages by transcripts.messages.collectAsStateWithLifecycle(initialValue = emptyList())
     val scope = rememberCoroutineScope()
+    var confirmClear by rememberSaveable { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -62,7 +67,7 @@ fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
         item {
             SectionHeader(
                 title = "Assistant",
-                subtitle = "Only transcripts the watch actually delivered",
+                subtitle = "Local transcript history",
                 trailing = {
                     Badge(
                         text = if (messages.isEmpty()) "empty" else "${messages.size}",
@@ -78,11 +83,8 @@ fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
 
         item {
             InlineNotice(
-                title = "What this screen can and cannot show",
-                message = "The reference application's Bluetooth SDK exposes phone-to-watch " +
-                    "recording controls (start recording, stop recording, ask a question) but no " +
-                    "channel that delivers a recognised transcript back to the phone. Until that " +
-                    "changes, this list stays empty. It is not filled with examples.",
+                title = "Watch transcript delivery unavailable",
+                message = "The known Bluetooth interface provides recording controls. Entries from earlier builds have a legacy label.",
                 tone = NoticeTone.INFO
             )
         }
@@ -109,8 +111,7 @@ fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
                 EmptyState(
                     icon = Icons.Outlined.RecordVoiceOver,
                     title = "No transcripts",
-                    message = "The watch has not delivered any transcript to this phone. When it " +
-                        "does, it will appear here with the time it arrived."
+                    message = "No watch transcripts are stored on this phone."
                 )
             }
         } else {
@@ -121,7 +122,8 @@ fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Badge(
-                            text = if (message.sender == "user") "you" else "watch",
+                            text = if (message.status != "captured") "legacy entry"
+                            else if (message.sender == "user") "you" else "watch",
                             color = MaterialTheme.colorScheme.primary
                         )
                         Spacer(Modifier.width(Spacing.sm))
@@ -143,12 +145,25 @@ fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
             }
 
             item {
-                OutlinedButton(onClick = { scope.launch { transcripts.clear() } }) {
+                OutlinedButton(onClick = { confirmClear = true }) {
                     Icon(Icons.Outlined.DeleteOutline, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
                     Text("Clear history")
                 }
             }
         }
+    }
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Clear local transcript history?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmClear = false
+                    scope.launch { transcripts.clear() }
+                }) { Text("Clear history") }
+            },
+            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } }
+        )
     }
 }

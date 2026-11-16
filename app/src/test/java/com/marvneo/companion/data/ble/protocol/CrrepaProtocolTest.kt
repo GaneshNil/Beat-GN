@@ -40,6 +40,18 @@ class CrrepaProtocolTest {
     }
 
     @Test
+    fun `MTU framing selects version by usable chunk size while preserving opcode and payload`() {
+        val original = CrrepaProtocol.heartRateMeasurement(true)
+        assertArrayEquals(original, CrrepaProtocol.forMtu(original, 0))
+        assertArrayEquals(original, CrrepaProtocol.forMtu(original, 26))
+        assertArrayEquals(
+            byteArrayOf(0xFE.toByte(), 0xEA.toByte(), 0x20, 6, 0x6D, 0),
+            CrrepaProtocol.forMtu(original, 247)
+        )
+        assertEquals(0x10, original[2].toInt())
+    }
+
+    @Test
     fun `parse round-trips a framed command`() {
         val raw = CrrepaProtocol.frame(CrrepaProtocol.CMD_HEART_RATE_ONCE, byteArrayOf(0))
         val parsed = CrrepaProtocol.parse(raw)
@@ -54,6 +66,11 @@ class CrrepaProtocolTest {
         assertNull(CrrepaProtocol.parse(byteArrayOf(0xFE.toByte(), 0xEA.toByte(), 0x10, 0x05)))
         assertNull(CrrepaProtocol.parse(byteArrayOf(0xFE.toByte(), 0xEA.toByte(), 0x10, 0x02, 0x61)))
         assertNull(CrrepaProtocol.parse(byteArrayOf(0xFE.toByte(), 0xEA.toByte(), 0x10, 0x09, 0x61)))
+    }
+
+    @Test
+    fun `direct parsing rejects the same invalid version as reassembly`() {
+        assertNull(CrrepaProtocol.parse(byteArrayOf(0xFE.toByte(), 0xEA.toByte(), 0, 5, 0x61)))
     }
 
     @Test

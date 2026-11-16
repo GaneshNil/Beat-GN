@@ -5,6 +5,10 @@ object AlarmSlots {
 
     const val COUNT = 5
 
+    fun isValid(slot: Int, hour: Int, minute: Int, repeatDays: Int, enabled: Boolean): Boolean =
+        slot in 0 until COUNT && hour in 0..23 && minute in 0..59 &&
+            repeatDays in 0..0x7F && (!enabled || repeatDays != 0)
+
     /**
      * The first unused slot in `0..4`, or null when every slot is occupied.
      *

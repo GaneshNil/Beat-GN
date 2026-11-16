@@ -83,13 +83,14 @@ sealed interface CommandOutcome {
 
 /** State of one health measurement request. */
 sealed interface MeasurementState {
+    val active: Boolean get() = this is Requesting || this is InProgress
+
     data object Idle : MeasurementState
     data object Requesting : MeasurementState
     data class InProgress(val startedAt: Long) : MeasurementState
     data class Completed(val value: Int, val secondary: Int? = null, val at: Long = System.currentTimeMillis()) : MeasurementState
     data class TimedOut(val reason: String) : MeasurementState
     data class Failed(val reason: String) : MeasurementState
-    data object NotSupported : MeasurementState
 }
 
 data class VoiceMessage(

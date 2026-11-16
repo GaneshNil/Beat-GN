@@ -4,15 +4,24 @@ import com.marvneo.companion.data.db.dao.HealthDao
 import com.marvneo.companion.data.db.entity.BloodOxygenRecord
 import com.marvneo.companion.data.db.entity.BloodPressureRecord
 import com.marvneo.companion.data.db.entity.HeartRateRecord
+import com.marvneo.companion.data.db.entity.StepRecord
 import com.marvneo.companion.domain.report.HealthAggregator
 import com.marvneo.companion.domain.report.HealthReport
 import com.marvneo.companion.domain.report.ReportPeriod
 import com.marvneo.companion.domain.report.ReportWindows
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.time.Instant
 import java.time.ZoneId
 
 /**
@@ -22,12 +31,14 @@ import java.time.ZoneId
 class HealthRepository(
     private val dao: HealthDao,
     private val clock: () -> Long = System::currentTimeMillis,
-    private val zone: ZoneId = ZoneId.systemDefault()
+    private val zone: ZoneId? = null
 ) {
 
     enum class WriteResult { STORED, DUPLICATE, INVALID }
 
     private val refreshSignal = MutableStateFlow(0L)
+    private val writeMutex = Mutex()
+    private var latestStep: StepRecord? = null
 
     /**
      * True when this install has ever stored a blood-pressure reading, independent of the current
@@ -36,38 +47,58 @@ class HealthRepository(
     val bloodPressureEverRecorded: Flow<Boolean> = dao.hasAnyBloodPressure()
 
     fun requestRefresh() {
-        refreshSignal.value = clock()
+        refreshSignal.update { it + 1 }
     }
 
-    suspend fun recordHeartRate(bpm: Int, at: Long = clock()): WriteResult {
-        if (bpm !in 25..250) return WriteResult.INVALID
-        if (dao.countHeartRateInWindow(bpm, at - 5_000, at + 5_000) > 0) return WriteResult.DUPLICATE
+    suspend fun recordSteps(steps: Int, distance: Int, calories: Int, at: Long = clock()) =
+        writeMutex.withLock {
+            val current = StepRecord(timestamp = at, steps = steps, distanceMeters = distance, calories = calories)
+            val previous = latestStep ?: dao.getLatestSteps().first()
+            val localZone = zone ?: ZoneId.systemDefault()
+            if (previous != null && previous.copy(id = 0, timestamp = at) == current &&
+                localDate(previous.timestamp, localZone) == localDate(at, localZone)
+            ) {
+                latestStep = previous
+                return@withLock
+            }
+            dao.insertStep(current)
+            latestStep = current
+        }
+
+    suspend fun recordHeartRate(bpm: Int, at: Long = clock()): WriteResult = writeMutex.withLock {
+        if (bpm !in 25..250) return@withLock WriteResult.INVALID
+        val window = dedupeWindow(at)
+        if (dao.countHeartRateInWindow(bpm, window.first, window.last) > 0) return@withLock WriteResult.DUPLICATE
         dao.insertHeartRate(HeartRateRecord(timestamp = at, bpm = bpm))
         requestRefresh()
-        return WriteResult.STORED
+        WriteResult.STORED
     }
 
-    suspend fun recordBloodOxygen(percentage: Int, at: Long = clock()): WriteResult {
-        if (percentage !in 50..100) return WriteResult.INVALID
-        if (dao.countBloodOxygenInWindow(percentage, at - 5_000, at + 5_000) > 0) return WriteResult.DUPLICATE
+    suspend fun recordBloodOxygen(percentage: Int, at: Long = clock()): WriteResult = writeMutex.withLock {
+        if (percentage !in 50..100) return@withLock WriteResult.INVALID
+        val window = dedupeWindow(at)
+        if (dao.countBloodOxygenInWindow(percentage, window.first, window.last) > 0) {
+            return@withLock WriteResult.DUPLICATE
+        }
         dao.insertBloodOxygen(BloodOxygenRecord(timestamp = at, percentage = percentage))
         requestRefresh()
-        return WriteResult.STORED
+        WriteResult.STORED
     }
 
     suspend fun recordBloodPressure(
         systolic: Int,
         diastolic: Int,
         at: Long = clock()
-    ): WriteResult {
+    ): WriteResult = writeMutex.withLock {
         val valid = systolic in 60..255 && diastolic in 30..160 && systolic > diastolic
-        if (!valid) return WriteResult.INVALID
-        if (dao.countBloodPressureInWindow(systolic, diastolic, at - 5_000, at + 5_000) > 0) {
-            return WriteResult.DUPLICATE
+        if (!valid) return@withLock WriteResult.INVALID
+        val window = dedupeWindow(at)
+        if (dao.countBloodPressureInWindow(systolic, diastolic, window.first, window.last) > 0) {
+            return@withLock WriteResult.DUPLICATE
         }
         dao.insertBloodPressure(BloodPressureRecord(timestamp = at, systolic = systolic, diastolic = diastolic))
         requestRefresh()
-        return WriteResult.STORED
+        WriteResult.STORED
     }
 
     /**
@@ -77,7 +108,8 @@ class HealthRepository(
      */
     @OptIn(ExperimentalCoroutinesApi::class)
     fun report(period: ReportPeriod): Flow<HealthReport> =
-        refreshSignal.flatMapLatest {
+        combine(refreshSignal, calendarClock) { _, _ -> Unit }.flatMapLatest {
+            val zone = zone ?: ZoneId.systemDefault()
             val window = ReportWindows.of(period, clock(), zone)
             combine(
                 dao.getHeartRatesBetween(window.startMillis, window.endMillis),
@@ -94,4 +126,23 @@ class HealthRepository(
                 )
             }
         }
+
+    private val calendarClock = flow {
+        while (true) {
+            val localZone = zone ?: ZoneId.systemDefault()
+            emit(localZone to localDate(clock(), localZone))
+            delay(30_000)
+        }
+    }.distinctUntilChanged()
+
+    private fun localDate(timestamp: Long, zone: ZoneId) =
+        Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate()
+
+    private fun dedupeWindow(at: Long): LongRange {
+        val localZone = zone ?: ZoneId.systemDefault()
+        val day = localDate(at, localZone)
+        val start = day.atStartOfDay(localZone).toInstant().toEpochMilli()
+        val end = day.plusDays(1).atStartOfDay(localZone).toInstant().toEpochMilli() - 1
+        return maxOf(start, at - 5_000)..minOf(end, at + 5_000)
+    }
 }
