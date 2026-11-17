@@ -468,6 +468,8 @@ class MarvNeoBleManager(
 
     fun canReconnect(): Boolean = targetAddress != null || lastKnownAddress() != null
 
+    fun shouldMaintainConnection(): Boolean = !userDisconnected && canReconnect() && isAdapterEnabled()
+
     private fun prefs() = context.getSharedPreferences("marv_neo_prefs", Context.MODE_PRIVATE)
 
     // ------------------------------------------------------------------ connection

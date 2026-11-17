@@ -67,23 +67,22 @@ class WatchCompanionService : Service() {
             stopSelf()
             return
         }
-        createChannel()
         try {
+            createChannel()
             startForeground(notificationId, buildNotification("Starting…"))
             foregroundStarted = true
+            ContextCompat.registerReceiver(
+                this,
+                adapterReceiver,
+                IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+                ContextCompat.RECEIVER_EXPORTED
+            )
+            receiverRegistered = true
         } catch (error: RuntimeException) {
-            Log.w("WatchCompanionService", "Foreground start failed (${error.javaClass.simpleName})")
+            Log.w("WatchCompanionService", "Background watch setup failed (${error.javaClass.simpleName})")
             stopSelf()
             return
         }
-
-        ContextCompat.registerReceiver(
-            this,
-            adapterReceiver,
-            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
-            ContextCompat.RECEIVER_EXPORTED
-        )
-        receiverRegistered = true
 
         scope.launch {
             bleManager.connectionState.collectLatest { state ->
@@ -93,7 +92,7 @@ class WatchCompanionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!foregroundStarted || !bleManager.hasPermissions()) {
+        if (!receiverRegistered || !bleManager.hasPermissions()) {
             stopSelf()
             return START_NOT_STICKY
         }

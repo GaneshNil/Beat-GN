@@ -2,7 +2,7 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "codex/marv-neo-v006213-audit" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch: # Allows manual trigger from GitHub UI
@@ -33,6 +33,20 @@ jobs:
 
     - name: Build debug and instrumentation APKs
       run: ./gradlew assembleDebug assembleDebugAndroidTest --stacktrace
+
+    - name: Enable Android emulator acceleration
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    - name: Test app launch and Room migration on Android 16
+      uses: reactivecircus/android-emulator-runner@v2.38.0
+      with:
+        api-level: 36
+        target: google_apis
+        arch: x86_64
+        script: ./gradlew connectedDebugAndroidTest --stacktrace
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
