@@ -65,8 +65,8 @@ class MainActivity : ComponentActivity() {
     private var bluetoothGranted by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         permissionRequested = savedInstanceState?.getBoolean("permissionRequested") == true
 
         val app = application as MarvNeoApp
@@ -153,6 +153,14 @@ class MainActivity : ComponentActivity() {
                                     alarmRepository = app.alarms,
                                     bluetoothGranted = bluetoothGranted,
                                     onRequestBluetoothPermissions = { requestBluetoothAccess() },
+                                    onConnect = { address ->
+                                        bleManager.connect(address)
+                                        startCompanionIfNeeded()
+                                    },
+                                    onReconnect = {
+                                        bleManager.reconnect()
+                                        startCompanionIfNeeded()
+                                    },
                                     onOpenBatterySettings = { openBatterySettings() }
                                 )
 
@@ -174,10 +182,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onStart() {
-        super.onStart()
+    override fun onResume() {
+        super.onResume()
         refreshBluetoothAccess()
-        if (!permissionRequested) requestNeededPermissions()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -190,7 +197,7 @@ class MainActivity : ComponentActivity() {
         bluetoothGranted = app.bleManager.hasPermissions()
         app.bleManager.refreshAdapterState()
         app.healthRepository.requestRefresh()
-        if (bluetoothGranted) startCompanionService()
+        startCompanionIfNeeded()
     }
 
     private fun requestBluetoothAccess() {
@@ -201,7 +208,14 @@ class MainActivity : ComponentActivity() {
             openAppDetails()
         } else {
             permissionRequested = true
-            permissionLauncher.launch(missing.toTypedArray())
+            val permissions = missing.toMutableList()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            permissionLauncher.launch(permissions.toTypedArray())
         }
     }
 
@@ -212,21 +226,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestNeededPermissions() {
-        val missing = missingBluetoothPermissions().toMutableList()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            missing.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
-        if (missing.isEmpty()) return
-        permissionRequested = true
-        permissionLauncher.launch(missing.toTypedArray())
-    }
-
-    private fun startCompanionService() {
+    private fun startCompanionIfNeeded() {
+        val bleManager = (application as MarvNeoApp).bleManager
+        if (!bluetoothGranted || !bleManager.shouldMaintainConnection()) return
         runCatching {
             val intent = Intent(this, WatchCompanionService::class.java)
             ContextCompat.startForegroundService(this, intent)

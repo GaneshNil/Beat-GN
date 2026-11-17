@@ -71,6 +71,8 @@ fun WatchScreen(
     alarmRepository: AlarmRepository,
     bluetoothGranted: Boolean,
     onRequestBluetoothPermissions: () -> Unit,
+    onConnect: (String) -> Unit,
+    onReconnect: () -> Unit,
     onOpenBatterySettings: () -> Unit
 ) {
     val connection by bleManager.connectionState.collectAsStateWithLifecycle()
@@ -150,7 +152,7 @@ fun WatchScreen(
                     }
                     OutlinedButton(
                         enabled = bluetoothGranted && bluetoothOn && !linkActive && !scanning && bleManager.canReconnect(),
-                        onClick = { bleManager.reconnect() }
+                        onClick = onReconnect
                     ) {
                         Icon(Icons.Outlined.Refresh, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
@@ -168,7 +170,7 @@ fun WatchScreen(
                 )
             }
             items(devices, key = { it.address }) { device ->
-                AppCard(onClick = { bleManager.connect(device.address) }) {
+                AppCard(onClick = { onConnect(device.address) }) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
