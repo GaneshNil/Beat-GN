@@ -35,6 +35,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -44,6 +45,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.marvneo.companion.data.service.WatchCompanionService
 import com.marvneo.companion.ui.screens.AssistantScreen
 import com.marvneo.companion.ui.screens.HealthScreen
@@ -72,108 +74,110 @@ class MainActivity : ComponentActivity() {
         val app = application as MarvNeoApp
 
         setContent {
-            MarvNeoTheme {
-                val bleManager = app.bleManager
-                val healthRepository = app.healthRepository
+            CompositionLocalProvider(LocalLifecycleOwner provides this@MainActivity) {
+                MarvNeoTheme {
+                    val bleManager = app.bleManager
+                    val healthRepository = app.healthRepository
 
-                var selectedTab by rememberSaveable { mutableStateOf(0) }
-                var moreRoute by rememberSaveable { mutableStateOf<String?>(null) }
+                    var selectedTab by rememberSaveable { mutableStateOf(0) }
+                    var moreRoute by rememberSaveable { mutableStateOf<String?>(null) }
 
-                BackHandler(enabled = moreRoute != null) { moreRoute = null }
+                    BackHandler(enabled = moreRoute != null) { moreRoute = null }
 
-                val destinations = remember {
-                    listOf(
-                        Destination("Home", Icons.Outlined.Home),
-                        Destination("Health", Icons.Outlined.FavoriteBorder),
-                        Destination("Watch", Icons.Outlined.Watch),
-                        Destination("Assistant", Icons.Outlined.RecordVoiceOver),
-                        Destination("More", Icons.Outlined.MoreHoriz)
-                    )
-                }
+                    val destinations = remember {
+                        listOf(
+                            Destination("Home", Icons.Outlined.Home),
+                            Destination("Health", Icons.Outlined.FavoriteBorder),
+                            Destination("Watch", Icons.Outlined.Watch),
+                            Destination("Assistant", Icons.Outlined.RecordVoiceOver),
+                            Destination("More", Icons.Outlined.MoreHoriz)
+                        )
+                    }
 
-                Scaffold(
-                    modifier = Modifier.fillMaxSize(),
-                    containerColor = MaterialTheme.colorScheme.background,
-                    contentWindowInsets = WindowInsets.safeDrawing,
-                    bottomBar = {
-                        NavigationBar(
-                            containerColor = MaterialTheme.colorScheme.surface,
-                            tonalElevation = 0.dp
-                        ) {
-                            destinations.forEachIndexed { index, destination ->
-                                NavigationBarItem(
-                                    selected = selectedTab == index,
-                                    onClick = {
-                                        selectedTab = index
-                                        moreRoute = null
-                                    },
-                                    icon = {
-                                        Icon(destination.icon, contentDescription = destination.label)
-                                    },
-                                    label = { Text(destination.label) },
-                                    colors = NavigationBarItemDefaults.colors(
-                                        selectedIconColor = MaterialTheme.colorScheme.primary,
-                                        selectedTextColor = MaterialTheme.colorScheme.primary,
-                                        indicatorColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
-                                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                    Scaffold(
+                        modifier = Modifier.fillMaxSize(),
+                        containerColor = MaterialTheme.colorScheme.background,
+                        contentWindowInsets = WindowInsets.safeDrawing,
+                        bottomBar = {
+                            NavigationBar(
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                tonalElevation = 0.dp
+                            ) {
+                                destinations.forEachIndexed { index, destination ->
+                                    NavigationBarItem(
+                                        selected = selectedTab == index,
+                                        onClick = {
+                                            selectedTab = index
+                                            moreRoute = null
+                                        },
+                                        icon = {
+                                            Icon(destination.icon, contentDescription = destination.label)
+                                        },
+                                        label = { Text(destination.label) },
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = MaterialTheme.colorScheme.primary,
+                                            selectedTextColor = MaterialTheme.colorScheme.primary,
+                                            indicatorColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                                            unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
                                     )
-                                )
+                                }
                             }
                         }
-                    }
-                ) { innerPadding ->
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(innerPadding),
-                        color = MaterialTheme.colorScheme.background
-                    ) {
-                        AnimatedContent(
-                            targetState = selectedTab to moreRoute,
-                            transitionSpec = { fadeIn() togetherWith fadeOut() },
-                            label = "navigation"
-                        ) { (tab, route) ->
-                            when (tab) {
-                                0 -> HomeScreen(
-                                    bleManager = bleManager,
-                                    healthRepository = healthRepository,
-                                    onOpenWatch = { selectedTab = 2 },
-                                    onOpenHealth = { selectedTab = 1 }
-                                )
+                    ) { innerPadding ->
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(innerPadding),
+                            color = MaterialTheme.colorScheme.background
+                        ) {
+                            AnimatedContent(
+                                targetState = selectedTab to moreRoute,
+                                transitionSpec = { fadeIn() togetherWith fadeOut() },
+                                label = "navigation"
+                            ) { (tab, route) ->
+                                when (tab) {
+                                    0 -> HomeScreen(
+                                        bleManager = bleManager,
+                                        healthRepository = healthRepository,
+                                        onOpenWatch = { selectedTab = 2 },
+                                        onOpenHealth = { selectedTab = 1 }
+                                    )
 
-                                1 -> HealthScreen(
-                                    bleManager = bleManager,
-                                    healthRepository = healthRepository,
-                                    onOpenWatch = { selectedTab = 2 }
-                                )
+                                    1 -> HealthScreen(
+                                        bleManager = bleManager,
+                                        healthRepository = healthRepository,
+                                        onOpenWatch = { selectedTab = 2 }
+                                    )
 
-                                2 -> WatchScreen(
-                                    bleManager = bleManager,
-                                    alarmRepository = app.alarms,
-                                    bluetoothGranted = bluetoothGranted,
-                                    onRequestBluetoothPermissions = { requestBluetoothAccess() },
-                                    onConnect = { address ->
-                                        bleManager.connect(address)
-                                        startCompanionIfNeeded()
-                                    },
-                                    onReconnect = {
-                                        bleManager.reconnect()
-                                        startCompanionIfNeeded()
-                                    },
-                                    onOpenBatterySettings = { openBatterySettings() }
-                                )
+                                    2 -> WatchScreen(
+                                        bleManager = bleManager,
+                                        alarmRepository = app.alarms,
+                                        bluetoothGranted = bluetoothGranted,
+                                        onRequestBluetoothPermissions = { requestBluetoothAccess() },
+                                        onConnect = { address ->
+                                            bleManager.connect(address)
+                                            startCompanionIfNeeded()
+                                        },
+                                        onReconnect = {
+                                            bleManager.reconnect()
+                                            startCompanionIfNeeded()
+                                        },
+                                        onOpenBatterySettings = { openBatterySettings() }
+                                    )
 
-                                3 -> AssistantScreen(
-                                    transcripts = app.transcripts
-                                )
+                                    3 -> AssistantScreen(
+                                        transcripts = app.transcripts
+                                    )
 
-                                else -> MoreScreen(
-                                    bleManager = bleManager,
-                                    route = route,
-                                    onNavigate = { moreRoute = it },
-                                    onBack = { moreRoute = null }
-                                )
+                                    else -> MoreScreen(
+                                        bleManager = bleManager,
+                                        route = route,
+                                        onNavigate = { moreRoute = it },
+                                        onBack = { moreRoute = null }
+                                    )
+                                }
                             }
                         }
                     }
