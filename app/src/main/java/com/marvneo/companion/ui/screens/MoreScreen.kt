@@ -17,6 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Security
@@ -30,9 +31,13 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.marvneo.companion.data.ble.MarvNeoBleManager
@@ -157,6 +162,7 @@ private fun DeviceInfoPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
     val address by bleManager.connectedDeviceAddress.collectAsStateWithLifecycle()
     val name by bleManager.connectedDeviceName.collectAsStateWithLifecycle()
     val firmware by bleManager.firmwareVersion.collectAsStateWithLifecycle()
+    val software by bleManager.softwareVersion.collectAsStateWithLifecycle()
     val model by bleManager.modelNumber.collectAsStateWithLifecycle()
     val manufacturer by bleManager.manufacturerName.collectAsStateWithLifecycle()
     val mtu by bleManager.negotiatedMtu.collectAsStateWithLifecycle()
@@ -176,6 +182,7 @@ private fun DeviceInfoPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
                 KeyValueRow("Manufacturer", manufacturer ?: "not reported")
                 KeyValueRow("Model", model ?: "not reported")
                 KeyValueRow("Firmware", firmware ?: "not reported")
+                KeyValueRow("Software", software ?: "not reported")
                 KeyValueRow("MTU", if (mtu > 0) "$mtu bytes" else "not negotiated")
                 KeyValueRow(
                     "Last traffic",
@@ -207,6 +214,7 @@ private fun DeviceInfoPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
 @Composable
 private fun DiagnosticsPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
     val entries by bleManager.diagnostics.collectAsStateWithLifecycle()
+    val clipboard = LocalClipboardManager.current
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -222,10 +230,20 @@ private fun DiagnosticsPage(bleManager: MarvNeoBleManager, onBack: () -> Unit) {
             )
         }
         item {
-            OutlinedButton(onClick = { bleManager.clearDiagnostics() }) {
-                Icon(Icons.Outlined.DeleteOutline, contentDescription = null)
-                Spacer(Modifier.width(6.dp))
-                Text("Clear")
+            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+                OutlinedButton(
+                    onClick = { clipboard.setText(AnnotatedString(entries.joinToString("\n"))) },
+                    enabled = entries.isNotEmpty()
+                ) {
+                    Icon(Icons.Outlined.ContentCopy, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Copy")
+                }
+                OutlinedButton(onClick = { bleManager.clearDiagnostics() }, enabled = entries.isNotEmpty()) {
+                    Icon(Icons.Outlined.DeleteOutline, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Clear")
+                }
             }
         }
         if (entries.isEmpty()) {
@@ -302,6 +320,12 @@ private fun SoftwarePage(onBack: () -> Unit) {
 
 @Composable
 private fun AboutPage(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val version = remember(context) {
+        @Suppress("DEPRECATION")
+        val info = context.packageManager.getPackageInfo(context.packageName, 0)
+        "${info.versionName} (${info.longVersionCode})"
+    }
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
         contentPadding = PaddingValues(Spacing.lg, Spacing.lg, Spacing.lg, Spacing.xxl),
@@ -311,6 +335,7 @@ private fun AboutPage(onBack: () -> Unit) {
         item {
             AppCard {
                 KeyValueRow("App", "Marv Neo Companion")
+                KeyValueRow("Version", version)
                 KeyValueRow("Package", "com.marvneo.companion")
                 KeyValueRow("Android", "${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
                 KeyValueRow("Device", "${Build.MANUFACTURER} ${Build.MODEL}")

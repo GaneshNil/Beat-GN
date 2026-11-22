@@ -19,7 +19,7 @@ interface HealthDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertStep(record: StepRecord): Long
 
-    @Query("SELECT * FROM steps_record ORDER BY timestamp DESC LIMIT 1")
+    @Query("SELECT * FROM steps_record ORDER BY timestamp DESC, id DESC LIMIT 1")
     fun getLatestSteps(): Flow<StepRecord?>
 
     @Query("SELECT * FROM steps_record WHERE timestamp BETWEEN :start AND :end ORDER BY timestamp ASC")
@@ -64,8 +64,12 @@ interface HealthDao {
     @Query("SELECT COUNT(*) FROM blood_pressure_record WHERE systolic = :systolic AND diastolic = :diastolic AND timestamp BETWEEN :from AND :to")
     suspend fun countBloodPressureInWindow(systolic: Int, diastolic: Int, from: Long, to: Long): Int
 
-    @Query("SELECT EXISTS(SELECT 1 FROM blood_pressure_record)")
-    fun hasAnyBloodPressure(): Flow<Boolean>
+    // Early versions could save invalid positive pairs. Use the report's acceptance criteria.
+    @Query("""
+        SELECT EXISTS(SELECT 1 FROM blood_pressure_record
+        WHERE systolic BETWEEN 60 AND 255 AND diastolic BETWEEN 30 AND 160 AND systolic > diastolic)
+    """)
+    fun hasValidBloodPressure(): Flow<Boolean>
 
     // ---- Sleep ----
     @Insert(onConflict = OnConflictStrategy.IGNORE)

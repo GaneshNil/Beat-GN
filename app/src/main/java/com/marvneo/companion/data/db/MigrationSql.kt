@@ -1,7 +1,7 @@
 package com.marvneo.companion.data.db
 
 /**
- * The exact SQL used by the additive Room migrations.
+ * The SQL used by the Room migrations.
  *
  * Keeping the statements in one pure object lets a JVM test apply them to a real SQLite database
  * (see `MigrationSqlTest`) without an emulator. [AppDatabase] executes the same lists, so the
@@ -55,5 +55,25 @@ internal object MigrationSql {
         "ALTER TABLE `alarm_record` ADD COLUMN `syncState` TEXT NOT NULL DEFAULT 'PENDING'",
         "ALTER TABLE `alarm_record` ADD COLUMN `updatedAt` INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE `voice_messages` ADD COLUMN `sessionId` TEXT"
+    )
+
+    /** The watch can omit any activity field. Older rows have no recorded active minutes. */
+    val V4_TO_V5: List<String> = listOf(
+        """
+        CREATE TABLE steps_record_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            steps INTEGER,
+            calories INTEGER,
+            distanceMeters INTEGER,
+            activeMinutes INTEGER
+        )
+        """.trimIndent(),
+        """
+        INSERT INTO steps_record_new (id, timestamp, steps, calories, distanceMeters)
+        SELECT id, timestamp, steps, calories, distanceMeters FROM steps_record
+        """.trimIndent(),
+        "DROP TABLE steps_record",
+        "ALTER TABLE steps_record_new RENAME TO steps_record"
     )
 }

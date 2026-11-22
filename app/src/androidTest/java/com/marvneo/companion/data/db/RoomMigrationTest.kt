@@ -4,14 +4,32 @@ import android.database.sqlite.SQLiteDatabase
 import androidx.room.Room
 import androidx.test.platform.app.InstrumentationRegistry
 import com.marvneo.companion.data.db.entity.AlarmRecord
+import com.marvneo.companion.data.db.entity.BloodPressureRecord
+import com.marvneo.companion.data.db.entity.StepRecord
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.UUID
 
 class RoomMigrationTest {
+    @Test
+    fun invalidLegacyPressureRowsDoNotCountAsValidReadings() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).build()
+        try {
+            val dao = db.healthDao()
+            dao.insertBloodPressure(BloodPressureRecord(timestamp = 1000, systolic = 80, diastolic = 80))
+            assertFalse(dao.hasValidBloodPressure().first())
+            dao.insertBloodPressure(BloodPressureRecord(timestamp = 2000, systolic = 120, diastolic = 80))
+            assertTrue(dao.hasValidBloodPressure().first())
+        } finally {
+            db.close()
+        }
+    }
+
     @Test
     fun versionOneOpensThroughRoomAndKeepsOldHealthRows() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -40,11 +58,13 @@ class RoomMigrationTest {
                         "deepMinutes INTEGER NOT NULL, lightMinutes INTEGER NOT NULL, remMinutes INTEGER NOT NULL)"
                 )
                 legacy.execSQL("INSERT INTO heart_rate_record (timestamp, bpm) VALUES (1000, 72)")
+                legacy.execSQL("INSERT INTO steps_record VALUES (17, 1000, 100, 0, 60)")
                 legacy.version = 1
             }
 
             fun open(): AppDatabase = Room.databaseBuilder(context, AppDatabase::class.java, file)
-                .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
+                .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3,
+                    AppDatabase.MIGRATION_3_4, AppDatabase.MIGRATION_4_5)
                 .build()
 
             val alarm = AlarmRecord(0, 7, 30, 127, true, "Test alarm")
@@ -52,6 +72,9 @@ class RoomMigrationTest {
             try {
                 assertEquals(72, migrated.healthDao().getHeartRatesBetween(0, 2000).first().single().bpm)
                 assertTrue(migrated.voiceDao().getAllMessages().first().isEmpty())
+                assertEquals(StepRecord(17, 1000, 100, 0, 60), migrated.healthDao().getLatestSteps().first())
+                migrated.healthDao().insertStep(StepRecord(timestamp = 2000, steps = 0, calories = null,
+                    distanceMeters = null, activeMinutes = null))
                 migrated.healthDao().upsertAlarm(alarm)
             } finally {
                 migrated.close()
@@ -60,6 +83,10 @@ class RoomMigrationTest {
             val reopened = open()
             try {
                 assertEquals(alarm, reopened.healthDao().getAllAlarms().first().single())
+                val steps = reopened.healthDao().getStepsBetween(0, 2000).first()
+                assertEquals(2, steps.size)
+                assertEquals(StepRecord(17, 1000, 100, 0, 60), steps.first())
+                assertEquals(StepRecord(0, 2000, 0, null, null), steps.last().copy(id = 0))
             } finally {
                 reopened.close()
             }

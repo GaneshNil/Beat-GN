@@ -8,7 +8,8 @@ internal suspend fun MutableStateFlow<MeasurementState>.beginMeasurement(
     now: () -> Long = System::currentTimeMillis
 ): Boolean {
     if (value.active) return false
-    value = MeasurementState.Requesting
+    val request = MeasurementState.Requesting()
+    value = request
     val sent = sendStart()
     val next = if (sent) {
         MeasurementState.InProgress(now())
@@ -16,5 +17,5 @@ internal suspend fun MutableStateFlow<MeasurementState>.beginMeasurement(
         MeasurementState.Failed("Could not send measurement request")
     }
     // A notification or a link loss can arrive before the GATT write callback.
-    return compareAndSet(MeasurementState.Requesting, next) && sent
+    return compareAndSet(request, next) && sent
 }

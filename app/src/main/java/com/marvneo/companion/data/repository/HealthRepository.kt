@@ -41,18 +41,30 @@ class HealthRepository(
     private var latestStep: StepRecord? = null
 
     /**
-     * True when this install has ever stored a blood-pressure reading, independent of the current
-     * process. The previous in-memory-only flag forgot history after a restart.
+     * True when this install has stored a valid blood-pressure pair, including after a restart.
      */
-    val bloodPressureEverRecorded: Flow<Boolean> = dao.hasAnyBloodPressure()
+    val bloodPressureEverRecorded: Flow<Boolean> = dao.hasValidBloodPressure()
 
     fun requestRefresh() {
         refreshSignal.update { it + 1 }
     }
 
-    suspend fun recordSteps(steps: Int, distance: Int, calories: Int, at: Long = clock()) =
+    suspend fun recordSteps(
+        steps: Int?,
+        distance: Int?,
+        calories: Int?,
+        at: Long = clock(),
+        activeMinutes: Int? = null
+    ) =
         writeMutex.withLock {
-            val current = StepRecord(timestamp = at, steps = steps, distanceMeters = distance, calories = calories)
+            if (steps == null && distance == null && calories == null && activeMinutes == null) return@withLock
+            val current = StepRecord(
+                timestamp = at,
+                steps = steps,
+                distanceMeters = distance,
+                calories = calories,
+                activeMinutes = activeMinutes
+            )
             val previous = latestStep ?: dao.getLatestSteps().first()
             val localZone = zone ?: ZoneId.systemDefault()
             if (previous != null && previous.copy(id = 0, timestamp = at) == current &&

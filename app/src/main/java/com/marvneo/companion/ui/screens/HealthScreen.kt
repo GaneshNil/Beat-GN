@@ -241,7 +241,7 @@ fun HealthScreen(
                 )
             }
         } else {
-            items(records.take(60)) { record ->
+            items(records, key = { it.id }) { record ->
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -286,7 +286,7 @@ private fun PeriodChip(label: String, selected: Boolean, onClick: () -> Unit) {
 private fun MeasurementLine(label: String, state: MeasurementState) {
     val text = when (state) {
         MeasurementState.Idle -> "Idle"
-        MeasurementState.Requesting -> "Requesting…"
+        is MeasurementState.Requesting -> "Requesting…"
         is MeasurementState.InProgress -> "Measuring…"
         is MeasurementState.Completed ->
             if (state.secondary != null) "${state.value}/${state.secondary}"

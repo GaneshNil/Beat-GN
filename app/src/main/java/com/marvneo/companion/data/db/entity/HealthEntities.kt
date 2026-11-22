@@ -8,9 +8,10 @@ import androidx.room.PrimaryKey
 data class StepRecord(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val timestamp: Long,
-    val steps: Int,
-    val calories: Int,
-    val distanceMeters: Int
+    val steps: Int?,
+    val calories: Int?,
+    val distanceMeters: Int?,
+    val activeMinutes: Int? = null
 )
 
 @Entity(tableName = "heart_rate_record")

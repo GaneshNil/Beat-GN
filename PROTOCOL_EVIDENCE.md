@@ -59,7 +59,7 @@ all exist.
 | Notify | `0000fee8-…` | subscribed in `onServicesDiscovered` |
 | Battery | `180f` / `2a19` | standard; read by `queryDeviceBattery` |
 | Heart rate | `180d` / `2a37` | standard; `onCharacteristicChanged` routes `2a37` to the HR listener |
-| Device info | `180a` / `2a24`, `2a28`, `2a29` | standard model / firmware / manufacturer strings |
+| Device info | `180a` / `2a24`, `2a28`, `2a29` | historical SDK UUID mapping. The Bluetooth SIG assigns `2A28` to Software Revision and `2A26` to Firmware Revision. Beat-GN reads both independently. [Assigned Numbers](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Assigned_Numbers/out/en/index-en.html) |
 | CCCD | `2902` | `com.crrepa.l.f#Q` |
 
 The old app used `FFF0/FFF1/FFF2` and `FEE7/FEB1/FEB2`; the former appear nowhere in the vendor SDK
@@ -98,7 +98,7 @@ constant or absurd value while the sensor was idle.
 
 `com.crrepa.i.b#a([B, listener)` requires `payload.length == 3` and reads
 `systolic = payload[1]`, `diastolic = payload[2]`. `payload[0]` is a status byte. This app additionally
-rejects implausible pairs, and the UI reports "not supported" when no packet ever arrives.
+rejects implausible pairs, and the UI reports a timeout when the watch supplies no valid reply.
 
 ### Steps
 

@@ -151,6 +151,32 @@ class HealthRepositoryTest {
     }
 
     @Test
+    fun `partial activity snapshots preserve missing fields and changes to active minutes`() = runBlocking {
+        val dao = FakeHealthDao()
+        val repo = repository(dao)
+        repo.recordSteps(0, null, null, now)
+        repo.recordSteps(0, null, null, now + 1)
+        repo.recordSteps(null, null, null, now + 2, activeMinutes = 3)
+        repo.recordSteps(null, null, null, now + 3, activeMinutes = 4)
+        repo.recordSteps(null, null, null, now + 4)
+        assertEquals(listOf(
+            StepRecord(timestamp = now, steps = 0, calories = null, distanceMeters = null),
+            StepRecord(timestamp = now + 2, steps = null, calories = null, distanceMeters = null, activeMinutes = 3),
+            StepRecord(timestamp = now + 3, steps = null, calories = null, distanceMeters = null, activeMinutes = 4)
+        ), dao.stepRows)
+    }
+
+    @Test
+    fun `transport exceptions leave the phone alarm saved with a retryable failed status`() = runBlocking {
+        val dao = FakeHealthDao()
+        val repo = AlarmRepository(dao, { throw java.io.IOException("link lost") }, scope = this)
+        repo.save(AlarmRecord(0, 8, 0, 127, true, "Alarm"), newSlot = true, sendWhenReady = true)
+        repo.busy.first { !it }
+        assertEquals(AlarmSyncState.FAILED, dao.alarms.single().syncState)
+        assertTrue(repo.error.value.orEmpty().contains("watch"))
+    }
+
+    @Test
     fun `recording the same pulse just after local midnight keeps the first reading of the day`() = runBlocking {
         val dao = FakeHealthDao()
         val midnight = LocalDate.of(2026, 11, 17).atStartOfDay(zone).toInstant().toEpochMilli()
@@ -264,7 +290,7 @@ class HealthRepositoryTest {
             it.systolic == systolic && it.diastolic == diastolic && it.timestamp in from..to
         }
 
-        override fun hasAnyBloodPressure(): Flow<Boolean> = everBloodPressure
+        override fun hasValidBloodPressure(): Flow<Boolean> = everBloodPressure
 
         override suspend fun insertSleep(record: SleepRecord): Long = 0L
         override fun getSleepBetween(start: Long, end: Long): Flow<List<SleepRecord>> = flowOf(emptyList())

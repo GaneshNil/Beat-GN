@@ -287,6 +287,8 @@ object CrrepaProtocol {
     fun parseHeartRateMeasurement(value: ByteArray): Int? {
         if (value.size < 2) return null
         val flags = value[0].toInt() and 0xFF
+        // Bluetooth HRS 1.0 §3.1.1.1.2: contact sensing supported, but poor/no skin contact.
+        if (flags and 0x06 == 0x04) return null
         val bpm = if (flags and 0x01 == 0) {
             value[1].toInt() and 0xFF
         } else {
@@ -326,7 +328,7 @@ object CrrepaProtocol {
             ((bytes[offset + 2].toInt() and 0xFF) shl 16)
     }
 
-    /** Firmware string is read from the standard 0x2A28 characteristic, not from a packet. */
+    /** Decodes Device Information Service text such as firmware (2A26) or software (2A28) revision. */
     fun decodeFirmware(raw: ByteArray): String =
         String(raw, Charsets.UTF_8).trim { it <= ' ' || it == '\u0000' }
 
