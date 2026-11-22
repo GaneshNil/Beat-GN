@@ -65,6 +65,7 @@ fun HomeScreen(
     val heartRate by bleManager.heartRateFlow.collectAsStateWithLifecycle()
     val hrMeasurement by bleManager.heartRateMeasurement.collectAsStateWithLifecycle()
     val spo2Measurement by bleManager.spo2Measurement.collectAsStateWithLifecycle()
+    val bpMeasurement by bleManager.bloodPressureMeasurement.collectAsStateWithLifecycle()
 
     val ready = connection is ConnectionState.Ready
 
@@ -119,7 +120,7 @@ fun HomeScreen(
             }
         }
 
-        if (hrMeasurement.active || spo2Measurement.active) {
+        if (hrMeasurement.active || spo2Measurement.active || bpMeasurement.active) {
             item {
                 InlineNotice(
                     title = "Measurement running",
@@ -212,8 +213,7 @@ fun HomeScreen(
             item {
                 InlineNotice(
                     title = "No live link",
-                    message = "Metrics stay empty until the watch has been connected and has actually " +
-                        "sent data. Nothing here is simulated.",
+                    message = "Connect the watch to receive new readings. Today’s averages include readings saved on this phone.",
                     tone = NoticeTone.WARNING
                 )
             }
@@ -222,9 +222,8 @@ fun HomeScreen(
         if (heartRate > 0) {
             item {
                 InlineNotice(
-                    title = "Live pulse",
-                    message = "$heartRate bpm just now, streamed from the watch's heart-rate " +
-                        "characteristic.",
+                    title = "Last pulse received",
+                    message = "$heartRate bpm during this connection.",
                     tone = NoticeTone.POSITIVE
                 )
             }

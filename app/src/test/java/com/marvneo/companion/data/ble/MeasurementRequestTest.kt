@@ -1,6 +1,9 @@
 package com.marvneo.companion.data.ble
 
 import com.marvneo.companion.domain.model.MeasurementState
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -38,5 +41,27 @@ class MeasurementRequestTest {
             false
         }))
         assertEquals(failure, state.value)
+    }
+
+    @Test
+    fun `late start callback cannot complete a newer pending request`() = runBlocking {
+        val firstCallback = CompletableDeferred<Boolean>()
+        val first = async(start = CoroutineStart.UNDISPATCHED) {
+            state.beginMeasurement({ firstCallback.await() })
+        }
+        state.value = MeasurementState.Completed(96)
+
+        val secondCallback = CompletableDeferred<Boolean>()
+        val second = async(start = CoroutineStart.UNDISPATCHED) {
+            state.beginMeasurement({ secondCallback.await() }, now = { 123L })
+        }
+        val secondRequest = state.value
+        firstCallback.complete(true)
+        assertFalse(first.await())
+        assertEquals(secondRequest, state.value)
+
+        secondCallback.complete(true)
+        assertTrue(second.await())
+        assertEquals(MeasurementState.InProgress(123L), state.value)
     }
 }

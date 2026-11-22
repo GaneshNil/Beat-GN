@@ -26,7 +26,7 @@ import com.marvneo.companion.data.db.entity.VoiceMessageRecord
         VoiceMessageRecord::class,
         AlarmRecord::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -67,6 +67,12 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                MigrationSql.V4_TO_V5.forEach(db::execSQL)
+            }
+        }
+
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -74,7 +80,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "marv_neo_health.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .build()
                     .also { INSTANCE = it }
             }

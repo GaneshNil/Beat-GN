@@ -94,6 +94,7 @@ class MigrationSqlTest {
         exec(MigrationSql.V1_TO_V2)
         exec(MigrationSql.V2_TO_V3)
         exec(MigrationSql.V3_TO_V4)
+        exec(MigrationSql.V4_TO_V5)
     }
 
     private fun tableNames(): Set<String> {
@@ -163,6 +164,32 @@ class MigrationSqlTest {
         exec(MigrationSql.V1_TO_V2)
         exec(MigrationSql.V1_TO_V2)
         assertTrue(tableNames().contains("voice_messages"))
+    }
+
+    @Test
+    fun `version four activity values and IDs survive the upgrade alongside partial new rows`() {
+        exec(MigrationSql.V1_TO_V2 + MigrationSql.V2_TO_V3 + MigrationSql.V3_TO_V4)
+        exec(listOf("INSERT INTO steps_record VALUES (17, 1000, 100, 0, 60)"))
+        exec(MigrationSql.V4_TO_V5)
+        exec(listOf("INSERT INTO steps_record (timestamp, activeMinutes) VALUES (2000, 0)"))
+        db.createStatement().use { stmt ->
+            stmt.executeQuery("SELECT * FROM steps_record ORDER BY id").use { rows ->
+                assertTrue(rows.next())
+                assertEquals(17, rows.getInt("id"))
+                assertEquals(1000L, rows.getLong("timestamp"))
+                assertEquals(100, rows.getInt("steps"))
+                assertEquals(0, rows.getInt("calories"))
+                assertEquals(60, rows.getInt("distanceMeters"))
+                assertNull(rows.getObject("activeMinutes"))
+                assertTrue(rows.next())
+                assertTrue(rows.getInt("id") > 17)
+                assertNull(rows.getObject("steps"))
+                assertNull(rows.getObject("distanceMeters"))
+                assertNull(rows.getObject("calories"))
+                assertEquals(0, rows.getInt("activeMinutes"))
+                assertTrue(!rows.next())
+            }
+        }
     }
 
     @Test

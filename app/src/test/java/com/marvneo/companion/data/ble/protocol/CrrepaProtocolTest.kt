@@ -198,6 +198,14 @@ class CrrepaProtocolTest {
     }
 
     @Test
+    fun `a contact-aware sensor must detect skin before a pulse is accepted`() {
+        assertNull(CrrepaProtocol.parseHeartRateMeasurement(byteArrayOf(0x04, 72)))
+        assertNull(CrrepaProtocol.parseHeartRateMeasurement(byteArrayOf(0x05, 72, 0)))
+        assertEquals(72, CrrepaProtocol.parseHeartRateMeasurement(byteArrayOf(0x06, 72)))
+        assertEquals(72, CrrepaProtocol.parseHeartRateMeasurement(byteArrayOf(0x00, 72)))
+    }
+
+    @Test
     fun `step notification reads three little-endian triplets`() {
         val payload = byteArrayOf(
             0x10, 0x00, 0x00,       // 16 steps

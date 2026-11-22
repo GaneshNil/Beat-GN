@@ -71,6 +71,7 @@ fun WatchScreen(
     alarmRepository: AlarmRepository,
     bluetoothGranted: Boolean,
     onRequestBluetoothPermissions: () -> Unit,
+    onOpenPermissionSettings: (() -> Unit)?,
     onConnect: (String) -> Unit,
     onReconnect: () -> Unit,
     onOpenBatterySettings: () -> Unit
@@ -89,6 +90,7 @@ fun WatchScreen(
     val batteryKnown by bleManager.batteryKnown.collectAsStateWithLifecycle()
     val mtu by bleManager.negotiatedMtu.collectAsStateWithLifecycle()
     val firmware by bleManager.firmwareVersion.collectAsStateWithLifecycle()
+    val software by bleManager.softwareVersion.collectAsStateWithLifecycle()
 
     val ready = connection is ConnectionState.Ready
     var editSlot by rememberSaveable { mutableStateOf<Int?>(null) }
@@ -150,6 +152,9 @@ fun WatchScreen(
                             Text("Scan")
                         }
                     }
+                    if (!bluetoothGranted && onOpenPermissionSettings != null) {
+                        OutlinedButton(onClick = onOpenPermissionSettings) { Text("Open app settings") }
+                    }
                     OutlinedButton(
                         enabled = bluetoothGranted && bluetoothOn && !linkActive && !scanning && bleManager.canReconnect(),
                         onClick = onReconnect
@@ -170,7 +175,9 @@ fun WatchScreen(
                 )
             }
             items(devices, key = { it.address }) { device ->
-                AppCard(onClick = { onConnect(device.address) }) {
+                AppCard(onClick = if (device.connectable && bluetoothGranted && bluetoothOn) {
+                    { onConnect(device.address) }
+                } else null) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
@@ -179,7 +186,7 @@ fun WatchScreen(
                         Spacer(Modifier.width(Spacing.md))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = device.name,
+                                text = device.name.ifBlank { "Unnamed device" },
                                 style = MaterialTheme.typography.titleMedium,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
@@ -188,6 +195,11 @@ fun WatchScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            if (!device.connectable) {
+                                Text("Broadcast only", style = MaterialTheme.typography.labelSmall)
+                            } else if (device.advertisesCompanionService) {
+                                Text("Advertises FEEA", style = MaterialTheme.typography.labelSmall)
+                            }
                         }
                         if (device.likelyWatch) {
                             Badge("likely watch", MaterialTheme.colorScheme.primary)
@@ -314,6 +326,7 @@ fun WatchScreen(
                 )
                 KeyValueRow("MTU", if (mtu > 0) "$mtu" else "not negotiated")
                 KeyValueRow("Firmware", firmware ?: "not reported")
+                KeyValueRow("Software", software ?: "not reported")
                 KeyValueRow("Address suffix", address?.takeLast(5) ?: "—")
                 Spacer(Modifier.height(Spacing.md))
                 OutlinedButton(

@@ -58,7 +58,13 @@ class AlarmRepository(
 
     private suspend fun sendRecord(record: AlarmRecord) {
         dao.updateAlarmSyncState(record.id, AlarmSyncState.PENDING, System.currentTimeMillis())
-        val outcome = writeToWatch(record)
+        val outcome = try {
+            writeToWatch(record)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            CommandOutcome.Failed("Could not send the alarm to the watch. Check the watch before retrying.")
+        }
         val state = when (outcome) {
             is CommandOutcome.AwaitingAcknowledgement -> AlarmSyncState.SENT
             is CommandOutcome.Acknowledged -> AlarmSyncState.SYNCED

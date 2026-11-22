@@ -2,7 +2,7 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ "main", "master", "codex/marv-neo-v006213-audit" ]
+    branches: [ "main", "master", "codex/marv-neo-v006213-audit", "codex/marv-neo-field-fixes" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch: # Allows manual trigger from GitHub UI
@@ -47,6 +47,16 @@ jobs:
         target: google_apis
         arch: x86_64
         script: ./gradlew connectedDebugAndroidTest --stacktrace
+
+    - name: Upload Android test reports on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: android-test-reports
+        path: |
+          app/build/outputs/androidTest-results/connected/
+          app/build/reports/androidTests/connected/
+        if-no-files-found: ignore
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4

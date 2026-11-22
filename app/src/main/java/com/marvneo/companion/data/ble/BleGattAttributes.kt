@@ -44,7 +44,8 @@ object BleGattAttributes {
 
     val DEVICE_INFO_SERVICE: UUID = uuid16("180a")
     val MODEL_NUMBER_CHAR: UUID = uuid16("2a24")
-    val FIRMWARE_REVISION_CHAR: UUID = uuid16("2a28")
+    val FIRMWARE_REVISION_CHAR: UUID = uuid16("2a26")
+    val SOFTWARE_REVISION_CHAR: UUID = uuid16("2a28")
     val MANUFACTURER_NAME_CHAR: UUID = uuid16("2a29")
 
     /** Client Characteristic Configuration Descriptor (shared by every notifying characteristic). */

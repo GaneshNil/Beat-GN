@@ -14,3 +14,16 @@
 | Raw protocol data and address data could be disclosed; device transfer could copy storage | `MarvNeoBleManager.kt`, `WatchScreen.kt`, `MoreScreen.kt`, manifest and `data_extraction_rules.xml` | Retain metadata-only diagnostics and address suffixes. Exclude database and preferences from cloud backup and Android device transfer. | Source and merged manifest review. |
 | Room singleton initialization could create two instances and device migration had no test harness | `AppDatabase.kt`, `RoomMigrationTest.kt` | Recheck inside the lock and add an Android v1 fixture that uses real Room migration and reopens a saved alarm. | Six SQLite JVM tests; Android test APK compilation; execution blocked. |
 | AGP was below the supported SDK 35 version and SQLite JDBC bundled older fixes | `gradle/libs.versions.toml`, `app/build.gradle.kts`, `.github/workflows/build-apk.yml` | Update AGP to 8.6.1 and test-only SQLite JDBC. Add lifecycle-aware Compose collection and AndroidX test runner. CI compiles instrumentation APK. | Clean local Kotlin, Gradle, lint, APK and JVM test run. CI was reviewed locally. |
+
+## Beat-GN 1.1.3
+
+| Issue | Change | Verification |
+| --- | --- | --- |
+| The Android 16 launch crashed while resolving the Compose lifecycle owner | The previous startup patch supplies the Activity lifecycle owner. The launch test now visits Watch and About. | Android 16 UI instrumentation; owner screenshot shows Home rendering |
+| Scan selection lost the Android BLE device instance, and missing FEEA was reported as an unsupported watch | Retain the scanned device and prefer connectable FEEA rows. Validate discovered service instances, capture attribute metadata and allow copying it from Diagnostics. | JVM scan tests and Android GATT inventory tests |
+| GATT database changes could leave stale characteristic handles | Reconnect through the existing retry budget when Android reports a Service Changed event. Keep the current selection across radio toggles. | Code review; device test pending |
+| The UI labeled 2A28 as firmware | Read and show Firmware Revision (2A26) and Software Revision (2A28) independently. | Standard UUIDs and source trace; watch read pending |
+| An earlier measurement callback could update a newer pending request | Give each start a distinct request state. Reject heart-rate values with explicit contact loss. | Coroutine regression and parser tests |
+| Activity snapshots with missing fields were dropped | Save each reported field and migrate existing activity to Room 5. | Repository, SQLite and Room migration tests |
+| Failed alarm writes and interrupted transcript deletion gave misleading results | Persist alarm transport failure. Run confirmed transcript deletion in the repository and report storage errors. | Repository regressions |
+| Health showed at most 60 pulse rows and Home gave stale readings a fresh timestamp | List all readings in the selected period and label last received pulse. Show the installed version in About. | Source and Android navigation test |

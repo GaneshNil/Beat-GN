@@ -100,7 +100,9 @@ class MarvNeoBleManager(
     private var stepCharacteristic: BluetoothGattCharacteristic? = null
     private var batteryCharacteristic: BluetoothGattCharacteristic? = null
 
-    private var targetAddress: String? = null
+    // Retain the BluetoothDevice supplied by the scanner, including its LE address type.
+    private val scannedDevices = mutableMapOf<String, BluetoothDevice>()
+    private var selectedDevice: BluetoothDevice? = null
     private var userDisconnected = prefs().getBoolean("user_disconnected", false)
     private var reconnectAttempt = 0
 
@@ -128,6 +130,7 @@ class MarvNeoBleManager(
     val lastCommunicationTimestamp = MutableStateFlow(0L)
     val negotiatedMtu = MutableStateFlow(0)
     val firmwareVersion = MutableStateFlow<String?>(null)
+    val softwareVersion = MutableStateFlow<String?>(null)
     val modelNumber = MutableStateFlow<String?>(null)
     val manufacturerName = MutableStateFlow<String?>(null)
 
@@ -208,6 +211,11 @@ class MarvNeoBleManager(
             negotiatedMtu.value = effective
             log("MTU now $effective (status $status)")
             gattOperations.complete(gatt, Request(Kind.MTU), status == BluetoothGatt.GATT_SUCCESS)
+        }
+
+        override fun onServiceChanged(gatt: BluetoothGatt) {
+            if (!isCurrent(gatt, "service-changed")) return
+            handleLinkLost("Device services changed; rediscovering the watch profile")
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -324,16 +332,17 @@ class MarvNeoBleManager(
         }
     }
 
-    fun onBluetoothTurnedOff() {
+    private fun onBluetoothTurnedOff() {
         log("Bluetooth turned off")
         stopScan()
+        clearScanResults()
         reconnectJob?.cancel()
         closeGatt()
         _connectionState.value = ConnectionState.BluetoothOff
         _bluetoothEnabled.value = false
     }
 
-    fun onBluetoothTurnedOn() {
+    private fun onBluetoothTurnedOn() {
         if (!_bluetoothEnabled.value) reconnectAttempt = 0
         _bluetoothEnabled.value = true
         if (_connectionState.value is ConnectionState.BluetoothOff) {
@@ -373,7 +382,7 @@ class MarvNeoBleManager(
             return
         }
         reconnectJob?.cancel()
-        _discoveredDevices.value = emptyList()
+        clearScanResults()
         _isScanning.value = true
         _connectionState.value = ConnectionState.Scanning()
 
@@ -426,30 +435,37 @@ class MarvNeoBleManager(
         }
     }
 
+    private fun clearScanResults() {
+        scannedDevices.clear()
+        _discoveredDevices.value = emptyList()
+    }
+
     private fun handleScanResult(result: ScanResult) {
         if (!hasPermissions()) {
             stopScan()
+            clearScanResults()
             _connectionState.value = ConnectionState.Failed("Bluetooth permission revoked", retryable = false)
             return
         }
         val device = result.device ?: return
-        val name = result.scanRecord?.deviceName ?: runCatching { device.name }.getOrNull()
+        val name = (result.scanRecord?.deviceName ?: runCatching { device.name }.getOrNull())
+            .orEmpty().maskBluetoothAddresses()
+        if (result.isConnectable) scannedDevices[device.address] = device
+        val advertisesCompanionService = result.scanRecord?.serviceUuids.orEmpty()
+            .any { it.uuid == BleGattAttributes.CRP_SERVICE_FEEA }
         val record = DiscoveredDevice(
-            name = name?.takeIf { it.isNotBlank() } ?: "Unnamed device",
+            name = name,
             address = device.address,
             rssi = result.rssi,
             isBonded = runCatching { device.bondState == BluetoothDevice.BOND_BONDED }.getOrDefault(false),
-            likelyWatch = looksLikeWatch(name.orEmpty(), device) ||
-                result.scanRecord?.serviceUuids.orEmpty().any { it.uuid == BleGattAttributes.CRP_SERVICE_FEEA }
+            likelyWatch = advertisesCompanionService || looksLikeWatch(name, device),
+            advertisesCompanionService = advertisesCompanionService,
+            connectable = result.isConnectable
         )
+        _discoveredDevices.value = _discoveredDevices.value.withScanResult(record)
 
-        _discoveredDevices.value = (_discoveredDevices.value.filterNot { it.address == record.address } + record)
-            .sortedWith(compareByDescending<DiscoveredDevice> { it.likelyWatch }
-                .thenByDescending { it.isBonded }
-                .thenByDescending { it.rssi })
-
-        if (record.likelyWatch && _connectionState.value is ConnectionState.Scanning) {
-            _connectionState.value = ConnectionState.WatchFound(record.name, record.address, record.rssi)
+        if (record.connectable && record.likelyWatch && _connectionState.value is ConnectionState.Scanning) {
+            _connectionState.value = ConnectionState.WatchFound(name.ifBlank { "Watch" }, record.address, record.rssi)
         }
     }
 
@@ -463,30 +479,31 @@ class MarvNeoBleManager(
         return major == android.bluetooth.BluetoothClass.Device.Major.WEARABLE
     }
 
-    fun lastKnownAddress(): String? =
+    private fun lastKnownAddress(): String? =
         prefs().getString("last_device_address", null)
 
-    fun canReconnect(): Boolean = targetAddress != null || lastKnownAddress() != null
+    fun canReconnect(): Boolean = selectedDevice != null || lastKnownAddress() != null
 
-    fun shouldMaintainConnection(): Boolean = !userDisconnected && canReconnect() && isAdapterEnabled()
+    fun shouldMaintainConnection(): Boolean =
+        !userDisconnected && _connectionState.value !is ConnectionState.Failed && canReconnect()
 
     private fun prefs() = context.getSharedPreferences("marv_neo_prefs", Context.MODE_PRIVATE)
 
     // ------------------------------------------------------------------ connection
 
-    /** A previous verified selection may reconnect; discovery still uses the Scan screen. */
+    /** Resume the current selection or restore the last verified device after a process restart. */
     fun autoConnect(): Boolean {
         if (userDisconnected || !hasPermissions()) return false
         if (gatt != null || _isScanning.value || reconnectJob?.isActive == true) return true
         if ((_connectionState.value as? ConnectionState.Failed)?.retryable == false ||
             reconnectAttempt >= MAX_RECONNECT_ATTEMPTS
         ) return false
-        val saved = targetAddress ?: lastKnownAddress() ?: return false
+        val saved = selectedDevice?.address ?: lastKnownAddress() ?: return false
         return connectInternal(saved, isReconnect = false)
     }
 
     fun reconnect(): Boolean {
-        val address = targetAddress ?: lastKnownAddress() ?: return false
+        val address = selectedDevice?.address ?: lastKnownAddress() ?: return false
         return connectInternal(address, isReconnect = false)
     }
 
@@ -517,27 +534,32 @@ class MarvNeoBleManager(
         if (gatt != null && address.equals(connectedDeviceAddress.value, ignoreCase = true)) return true
 
         val device = try {
-            adapter.getRemoteDevice(address)
+            scannedDevices[address] ?: selectedDevice?.takeIf { it.address == address } ?: run {
+                val addressType = prefs().getInt("last_device_address_type", -1)
+                if (Build.VERSION.SDK_INT >= 33 && lastKnownAddress() == address &&
+                    (addressType == BluetoothDevice.ADDRESS_TYPE_PUBLIC || addressType == BluetoothDevice.ADDRESS_TYPE_RANDOM)
+                ) adapter.getRemoteLeDevice(address, addressType) else adapter.getRemoteDevice(address)
+            }
         } catch (_: IllegalArgumentException) {
             _connectionState.value = ConnectionState.Failed("Invalid Bluetooth address", retryable = false)
             return false
         }
 
         stopScan()
-        _discoveredDevices.value = emptyList()
+        clearScanResults()
         if (!isReconnect) {
             setUserDisconnected(false)
             reconnectAttempt = 0
             reconnectJob?.cancel()
         }
-        targetAddress = address
+        selectedDevice = device
         closeGatt()
 
-        val name = runCatching { device.name }.getOrNull() ?: "Smartwatch"
+        val name = runCatching { device.name }.getOrNull()?.maskBluetoothAddresses() ?: "Smartwatch"
         connectedDeviceName.value = name
         connectedDeviceAddress.value = address
         _connectionState.value = ConnectionState.Connecting(name, address)
-        log("Opening GATT connection")
+        log("Opening GATT connection to …${address.takeLast(5)}")
 
         try {
             gatt = device.connectGatt(
@@ -566,7 +588,7 @@ class MarvNeoBleManager(
 
     fun disconnect() {
         setUserDisconnected(true)
-        targetAddress = null
+        selectedDevice = null
         reconnectJob?.cancel()
         stopScan()
         log("User disconnected")
@@ -585,42 +607,20 @@ class MarvNeoBleManager(
             return
         }
 
-        // 3. Resolve the Crrepa data channel.
-        val service = gatt.getService(BleGattAttributes.CRP_SERVICE_FEEA)
-        if (service == null) {
-            log("Device does not expose the Crrepa FEEA service")
-            _connectionState.value = ConnectionState.Failed(
-                "Not a supported watch: the Crrepa data service (FEEA) is missing",
-                retryable = false
-            )
-            closeGatt()
-            return
+        val profile = resolveWatchProfile(gatt.services)
+        val (fee1, fee2, fee3) = when (profile) {
+            is WatchGattProfile.Channels -> profile
+            is WatchGattProfile.Missing -> {
+                logUnexpectedProfile(gatt.services)
+                selectedDevice = null
+                _connectionState.value = ConnectionState.Failed(
+                    "${profile.reason} Scan again in Watch. More → Diagnostics lists the services found.",
+                    retryable = false
+                )
+                closeGatt()
+                return
+            }
         }
-
-        fun char(uuid: java.util.UUID) = service.getCharacteristic(uuid)
-
-        val fee1 = char(BleGattAttributes.CRP_CHAR_FEE1)
-        val fee2 = char(BleGattAttributes.CRP_CHAR_FEE2)
-        val fee3 = char(BleGattAttributes.CRP_CHAR_FEE3)
-
-        if (fee1 == null || fee2 == null || fee3 == null) {
-            // The vendor SDK treats a device as valid only when FEE1, FEE2 and FEE3 all exist.
-            log("FEEA present but FEE1/FEE2/FEE3 incomplete")
-            _connectionState.value = ConnectionState.Failed(
-                "Watch data channel incomplete (FEE1/FEE2/FEE3)",
-                retryable = false
-            )
-            closeGatt()
-            return
-        }
-        if (fee2.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
-                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) == 0
-        ) {
-            _connectionState.value = ConnectionState.Failed("Watch command channel is not writable", retryable = false)
-            closeGatt()
-            return
-        }
-
         writeCharacteristic = fee2
         packetCharacteristic = fee3
         stepCharacteristic = fee1
@@ -661,7 +661,7 @@ class MarvNeoBleManager(
         } else if (gatt === this.gatt) {
             log("Handshake read did not confirm the link")
             _connectionState.value = ConnectionState.Unstable(
-                reason = "Watch link awaiting a valid battery read",
+                reason = batteryVerificationProblem(),
                 lastVerifiedAt = null,
                 connected = true
             )
@@ -671,15 +671,30 @@ class MarvNeoBleManager(
         scope.launch { readDeviceInformation(gatt) }
     }
 
+    private fun logUnexpectedProfile(services: List<BluetoothGattService>) {
+        log("Watch data profile incomplete. Discovered GATT services: ${services.size}")
+        services.forEach { service ->
+            val characteristics = service.characteristics.joinToString { characteristic ->
+                val cccd = characteristic.getDescriptor(BleGattAttributes.CCCD) != null
+                "${characteristic.uuid} (properties=0x${characteristic.properties.toString(16)}, CCCD=$cccd)"
+            }
+            log("Service ${service.uuid}: ${characteristics.ifEmpty { "no characteristics" }}")
+        }
+    }
+
     private fun publishReady(gatt: BluetoothGatt) {
         if (gatt !== this.gatt) return
         val now = System.currentTimeMillis()
         reconnectAttempt = 0
         val name = connectedDeviceName.value ?: "Smartwatch"
         val address = gatt.device.address
-        prefs().edit()
-            .putString("last_device_address", address)
-            .apply()
+        val settings = prefs().edit().putString("last_device_address", address)
+        if (Build.VERSION.SDK_INT >= 35) {
+            settings.putInt("last_device_address_type", gatt.device.addressType)
+        } else {
+            settings.remove("last_device_address_type")
+        }
+        settings.apply()
 
         _connectionState.value = ConnectionState.Ready(
             deviceName = name,
@@ -735,6 +750,15 @@ class MarvNeoBleManager(
         return false
     }
 
+    private fun batteryVerificationProblem(): String {
+        val characteristic = batteryCharacteristic ?: return "The selected device has no Battery Level characteristic (2A19)"
+        return if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) {
+            "The selected device does not allow Battery Level reads (2A19)"
+        } else {
+            "Awaiting a valid Battery Level response (2A19)"
+        }
+    }
+
     private suspend fun verifyLink(gatt: BluetoothGatt): Boolean {
         val battery = batteryCharacteristic ?: return false
         if (battery.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) return false
@@ -751,6 +775,7 @@ class MarvNeoBleManager(
         val info = gatt.getService(BleGattAttributes.DEVICE_INFO_SERVICE) ?: return
         for (uuid in listOf(
             BleGattAttributes.FIRMWARE_REVISION_CHAR,
+            BleGattAttributes.SOFTWARE_REVISION_CHAR,
             BleGattAttributes.MODEL_NUMBER_CHAR,
             BleGattAttributes.MANUFACTURER_NAME_CHAR
         )) {
@@ -772,6 +797,7 @@ class MarvNeoBleManager(
             }
 
             BleGattAttributes.FIRMWARE_REVISION_CHAR -> firmwareVersion.value = readDeviceString(value)
+            BleGattAttributes.SOFTWARE_REVISION_CHAR -> softwareVersion.value = readDeviceString(value)
             BleGattAttributes.MODEL_NUMBER_CHAR -> modelNumber.value = readDeviceString(value)
             BleGattAttributes.MANUFACTURER_NAME_CHAR -> manufacturerName.value = readDeviceString(value)
         }
@@ -781,7 +807,7 @@ class MarvNeoBleManager(
         value.singleOrNull()?.toInt()?.and(0xFF)?.takeIf { it in 0..100 }
 
     private fun readDeviceString(value: ByteArray): String? =
-        CrrepaProtocol.decodeFirmware(value).takeIf { it.isNotBlank() }
+        CrrepaProtocol.decodeFirmware(value).maskBluetoothAddresses().takeIf { it.isNotBlank() }
 
     private fun markTraffic() {
         lastTrafficElapsed = SystemClock.elapsedRealtime()
@@ -790,7 +816,7 @@ class MarvNeoBleManager(
 
     private fun handleLinkLost(reason: String) {
         log("Link lost: $reason")
-        val shouldReconnect = !userDisconnected && targetAddress != null && hasPermissions() &&
+        val shouldReconnect = !userDisconnected && selectedDevice != null && hasPermissions() &&
             isAdapterEnabled()
         closeGatt()
         if (shouldReconnect) {
@@ -801,7 +827,7 @@ class MarvNeoBleManager(
     }
 
     private fun scheduleReconnect() {
-        val address = targetAddress ?: return
+        val address = selectedDevice?.address ?: return
         if (userDisconnected) return
         val delayMs = reconnectDelayMillis(reconnectAttempt)
         if (delayMs == null) {
@@ -816,7 +842,7 @@ class MarvNeoBleManager(
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             delay(delayMs)
-            if (!userDisconnected && targetAddress == address) {
+            if (!userDisconnected && selectedDevice?.address == address) {
                 connectInternal(address, isReconnect = true)
             }
         }
@@ -853,6 +879,7 @@ class MarvNeoBleManager(
         batteryKnown.value = false
         batteryReadMessage.value = null
         firmwareVersion.value = null
+        softwareVersion.value = null
         modelNumber.value = null
         manufacturerName.value = null
         lastCommunicationTimestamp.value = 0
@@ -933,7 +960,7 @@ class MarvNeoBleManager(
         when {
             characteristic === heartRateCharacteristic && pulseAvailable.value ->
                 CrrepaProtocol.parseHeartRateMeasurement(value)?.let(::onHeartRate)
-                    ?: log("Invalid heart-rate notification")
+                    ?: log("No valid pulse in heart-rate notification")
             characteristic === stepCharacteristic ->
                 CrrepaProtocol.parseSteps(value)?.let(::onSteps) ?: log("Invalid step notification")
             characteristic === packetCharacteristic -> {
@@ -996,11 +1023,12 @@ class MarvNeoBleManager(
         ) return
         markTraffic()
 
-        val stepCount = steps.steps ?: return
-        val distance = steps.distanceMeters ?: return
-        val calories = steps.calories ?: return
         val timestamp = System.currentTimeMillis()
-        storeTelemetry { healthRepository.recordSteps(stepCount, distance, calories, timestamp) }
+        storeTelemetry {
+            healthRepository.recordSteps(
+                steps.steps, steps.distanceMeters, steps.calories, at = timestamp, activeMinutes = steps.activeMinutes
+            )
+        }
     }
 
     private fun storeTelemetry(write: suspend () -> Unit) {
@@ -1044,7 +1072,7 @@ class MarvNeoBleManager(
             batteryReadMessage.value = "Reading battery…"
             val verified = verifyLink(link)
             if (link !== gatt) return@launch
-            batteryReadMessage.value = if (verified) null else "No valid battery level received"
+            batteryReadMessage.value = if (verified) null else batteryVerificationProblem()
             if (verified && _connectionState.value is ConnectionState.Unstable) publishReady(link)
         }
     }
@@ -1151,8 +1179,9 @@ class MarvNeoBleManager(
     // ------------------------------------------------------------------ diagnostics
 
     private fun log(message: String) {
-        Log.d(TAG, message)
-        val entry = "${timestampNow()}  $message"
+        val safeMessage = message.maskBluetoothAddresses()
+        Log.d(TAG, safeMessage)
+        val entry = "${timestampNow()}  $safeMessage"
         _diagnostics.value = (_diagnostics.value + entry).takeLast(DIAGNOSTIC_LIMIT)
     }
 

@@ -59,7 +59,9 @@ data class DiscoveredDevice(
     val address: String,
     val rssi: Int = -100,
     val isBonded: Boolean = false,
-    val likelyWatch: Boolean = false
+    val likelyWatch: Boolean = false,
+    val advertisesCompanionService: Boolean = false,
+    val connectable: Boolean = true
 )
 
 data class AlarmModel(
@@ -86,7 +88,7 @@ sealed interface MeasurementState {
     val active: Boolean get() = this is Requesting || this is InProgress
 
     data object Idle : MeasurementState
-    data object Requesting : MeasurementState
+    class Requesting : MeasurementState
     data class InProgress(val startedAt: Long) : MeasurementState
     data class Completed(val value: Int, val secondary: Int? = null, val at: Long = System.currentTimeMillis()) : MeasurementState
     data class TimedOut(val reason: String) : MeasurementState

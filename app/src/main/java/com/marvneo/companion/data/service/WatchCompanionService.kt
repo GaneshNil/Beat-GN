@@ -43,15 +43,13 @@ class WatchCompanionService : Service() {
     private val notificationId = 101
     private var receiverRegistered = false
     private var foregroundStarted = false
+    private var stoppingWhenIdle = false
 
     private val adapterReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
             when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
-                BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF ->
-                    bleManager.onBluetoothTurnedOff()
-
-                BluetoothAdapter.STATE_ON -> bleManager.onBluetoothTurnedOn()
+                BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_ON -> bleManager.refreshAdapterState()
             }
         }
     }
@@ -86,18 +84,28 @@ class WatchCompanionService : Service() {
 
         scope.launch {
             bleManager.connectionState.collectLatest { state ->
-                updateNotification(describe(state))
+                if (bleManager.shouldMaintainConnection()) {
+                    updateNotification(describe(state))
+                } else {
+                    stopWhenIdle()
+                }
             }
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!receiverRegistered || !bleManager.hasPermissions()) {
-            stopSelf()
+        if (!receiverRegistered || !bleManager.hasPermissions() || !bleManager.shouldMaintainConnection()) {
+            stopWhenIdle()
             return START_NOT_STICKY
         }
+        stoppingWhenIdle = false
         bleManager.autoConnect()
         return START_STICKY
+    }
+
+    private fun stopWhenIdle() {
+        stoppingWhenIdle = true
+        stopSelf()
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -105,7 +113,8 @@ class WatchCompanionService : Service() {
     override fun onDestroy() {
         if (receiverRegistered) unregisterReceiver(adapterReceiver)
         scope.coroutineContext.cancel()
-        if (foregroundStarted) bleManager.onServiceStopped()
+        // A new UI scan or selection can start between stopSelf() and onDestroy().
+        if (foregroundStarted && !stoppingWhenIdle) bleManager.onServiceStopped()
         super.onDestroy()
     }
 

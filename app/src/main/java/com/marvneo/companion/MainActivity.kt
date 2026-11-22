@@ -1,7 +1,11 @@
 package com.marvneo.companion
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -56,11 +60,20 @@ import com.marvneo.companion.ui.theme.MarvNeoTheme
 
 class MainActivity : ComponentActivity() {
 
-    private var permissionRequested = false
+    private var showPermissionSettings by mutableStateOf(false)
+
+    private val adapterReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED) refreshBluetoothAccess()
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) {
+    ) { result ->
+        val missing = missingBluetoothPermissions()
+        showPermissionSettings = missing.any { it in result } &&
+            missing.none { shouldShowRequestPermissionRationale(it) }
         refreshBluetoothAccess()
     }
 
@@ -69,7 +82,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        permissionRequested = savedInstanceState?.getBoolean("permissionRequested") == true
+        showPermissionSettings = savedInstanceState?.getBoolean("showPermissionSettings") == true
 
         val app = application as MarvNeoApp
 
@@ -156,6 +169,7 @@ class MainActivity : ComponentActivity() {
                                         alarmRepository = app.alarms,
                                         bluetoothGranted = bluetoothGranted,
                                         onRequestBluetoothPermissions = { requestBluetoothAccess() },
+                                        onOpenPermissionSettings = if (showPermissionSettings) ::openAppDetails else null,
                                         onConnect = { address ->
                                             bleManager.connect(address)
                                             startCompanionIfNeeded()
@@ -186,19 +200,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        ContextCompat.registerReceiver(
+            this, adapterReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+            ContextCompat.RECEIVER_EXPORTED
+        )
+    }
+
+    override fun onStop() {
+        unregisterReceiver(adapterReceiver)
+        super.onStop()
+    }
+
     override fun onResume() {
         super.onResume()
         refreshBluetoothAccess()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putBoolean("permissionRequested", permissionRequested)
+        outState.putBoolean("showPermissionSettings", showPermissionSettings)
         super.onSaveInstanceState(outState)
     }
 
     private fun refreshBluetoothAccess() {
         val app = application as MarvNeoApp
         bluetoothGranted = app.bleManager.hasPermissions()
+        if (bluetoothGranted) showPermissionSettings = false
         app.bleManager.refreshAdapterState()
         app.healthRepository.requestRefresh()
         startCompanionIfNeeded()
@@ -208,10 +236,7 @@ class MainActivity : ComponentActivity() {
         val missing = missingBluetoothPermissions()
         if (missing.isEmpty()) {
             refreshBluetoothAccess()
-        } else if (permissionRequested && missing.none { shouldShowRequestPermissionRationale(it) }) {
-            openAppDetails()
         } else {
-            permissionRequested = true
             val permissions = missing.toMutableList()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                 ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=

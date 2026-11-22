@@ -66,3 +66,21 @@ for unnecessary permissions and diagnostic disclosures. Git diff whitespace and 
 checks passed. Line or branch coverage percentages are unavailable because the project has no
 coverage task. Device-level BLE compatibility, actual permissions/service behavior, Compose
 interaction, TalkBack and SQLite framework migration still require [physical tests](DEVICE_TESTING_CHECKLIST.md).
+
+## 22 November 2026 follow-up for 1.1.3
+
+The previous startup patch passed the Android 16 emulator job after the lifecycle-owner fix was
+merged. The owner's Android 16 screenshot showed Home rendering and a selected device reporting no
+FEEA service. [Baseline GitHub Actions run](https://github.com/GaneshNil/Beat-GN/actions/runs/44052039407)
+
+Run with the installed JDK 17 and SDK 35:
+
+```bash
+./gradlew --offline clean testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest assembleRelease --console=plain
+```
+
+- **Build** succeeded in 2 minutes 37 seconds. Debug, Android test and unsigned release APKs were produced. Release R8 and resource shrinking completed.
+- **JVM tests** passed 104 of 104 with zero failures, errors or skipped tests. Eleven new tests cover scan result merging and ranking, address redaction, late measurement write callbacks, heart-rate sensor contact, partial activity storage, SQLite migration, alarm write failure and transcript deletion.
+- **Lint** reported zero errors, five existing warnings and two existing informational results. Dependency checks were offline.
+- **Android test APK** compiled seven tests. One checks fresh launch, Watch permission recovery UI and About. Two exercise Room and SQLite on Android. Four use synthetic Android GATT service inventories to verify the profile resolver. The GitHub workflow runs these on API 36 and gates APK upload on their result. [Build workflow](https://github.com/GaneshNil/Beat-GN/actions/workflows/build-apk.yml)
+- **Physical watch tests** remain blocked. ADB listed no phone. A 25-second host BLE scan found no matching target. See the [firmware report](MARV_NEO_V006213_COMPATIBILITY.md) and [manual checklist](DEVICE_TESTING_CHECKLIST.md).

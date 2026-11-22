@@ -23,7 +23,6 @@ import androidx.compose.runtime.Composable
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -37,7 +36,6 @@ import com.marvneo.companion.ui.components.InlineNotice
 import com.marvneo.companion.ui.components.NoticeTone
 import com.marvneo.companion.ui.components.SectionHeader
 import com.marvneo.companion.ui.theme.Spacing
-import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -51,7 +49,8 @@ import java.util.Locale
 @Composable
 fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
     val messages by transcripts.messages.collectAsStateWithLifecycle(initialValue = emptyList())
-    val scope = rememberCoroutineScope()
+    val clearing by transcripts.clearing.collectAsStateWithLifecycle()
+    val clearError by transcripts.clearError.collectAsStateWithLifecycle()
     var confirmClear by rememberSaveable { mutableStateOf(false) }
 
     LazyColumn(
@@ -106,6 +105,9 @@ fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
             }
         }
 
+        clearError?.let { reason ->
+            item { InlineNotice(title = "Could not clear history", message = reason, tone = NoticeTone.WARNING) }
+        }
         if (messages.isEmpty()) {
             item {
                 EmptyState(
@@ -115,7 +117,7 @@ fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
                 )
             }
         } else {
-            items(messages) { message ->
+            items(messages, key = { it.id }) { message ->
                 AppCard {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -145,7 +147,7 @@ fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
             }
 
             item {
-                OutlinedButton(onClick = { confirmClear = true }) {
+                OutlinedButton(enabled = !clearing, onClick = { confirmClear = true }) {
                     Icon(Icons.Outlined.DeleteOutline, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
                     Text("Clear history")
@@ -158,9 +160,9 @@ fun AssistantScreen(transcripts: AssistantTranscriptRepository) {
             onDismissRequest = { confirmClear = false },
             title = { Text("Clear local transcript history?") },
             confirmButton = {
-                TextButton(onClick = {
+                TextButton(enabled = !clearing, onClick = {
                     confirmClear = false
-                    scope.launch { transcripts.clear() }
+                    transcripts.clear()
                 }) { Text("Clear history") }
             },
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } }
